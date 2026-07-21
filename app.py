@@ -135,22 +135,14 @@ def sanitised_review_error_message(
             "The progress review could not be completed safely. No internal details "
             "were displayed; please try again."
         )
-    category = "validation" if isinstance(error, ValidationError) else "unknown"
-    if isinstance(error, AIServiceError):
-        category = error.category
-    if category not in {
-        "authentication",
-        "insufficient_quota",
-        "model_access",
-        "network",
-        "invalid_request",
-        "validation",
-        "unknown",
-    }:
-        category = "unknown"
+    if isinstance(error, ValidationError):
+        return (
+            "The AI progress review did not meet the required data format. A validated "
+            "local review is shown instead."
+        )
     return (
-        f"The OpenAI request failed. Error category: {category}. "
-        "The deterministic plan remains available."
+        "The AI progress review could not be completed. A validated local review is "
+        "shown instead."
     )
 
 
@@ -262,7 +254,10 @@ def render_event_form() -> None:
                 source = f"OpenAI Responses API · {get_model_name()}"
                 st.success("AI operations plan generated and schema-validated.")
             except AIServiceError as exc:
-                st.error(sanitised_review_error_message(exc), icon="⚠️")
+                st.error(str(exc), icon="⚠️")
+                st.warning(
+                    "A deterministic plan has been loaded so the dashboard remains usable."
+                )
                 plan = generate_demo_plan(brief)
                 source = "Demo fallback after API error"
     else:
@@ -396,18 +391,27 @@ def render_review(plan: OperationsPlan) -> None:
                         st.success("Current progress reviewed and schema-validated.")
                     except ValidationError as exc:
                         st.error(sanitised_review_error_message(exc), icon="⚠️")
+                        st.warning(
+                            "A deterministic progress review is shown so the workflow can continue."
+                        )
                         review = generate_demo_progress_review(
                             plan.event_brief, plan.actionable_tasks
                         )
                         source = "Demo fallback after API validation error"
                     except AIServiceError as exc:
                         st.error(sanitised_review_error_message(exc), icon="⚠️")
+                        st.warning(
+                            "A deterministic progress review is shown so the workflow can continue."
+                        )
                         review = generate_demo_progress_review(
                             plan.event_brief, plan.actionable_tasks
                         )
                         source = "Demo fallback after API error"
                     except Exception as exc:
                         st.error(sanitised_review_error_message(exc), icon="⚠️")
+                        st.warning(
+                            "A deterministic progress review is shown so the workflow can continue."
+                        )
                         review = generate_demo_progress_review(
                             plan.event_brief, plan.actionable_tasks
                         )
