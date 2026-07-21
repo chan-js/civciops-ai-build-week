@@ -1,0 +1,34 @@
+# Secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local generated data
+local_data/
+exports/
+*.log
+Codex Session ID.txt
+
+# Editors and operating systems
+.vscode/
+.idea/
+.agents/
+.codex/
+.DS_Store
+Thumbs.db
