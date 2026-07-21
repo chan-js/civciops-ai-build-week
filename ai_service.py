@@ -4,11 +4,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import sys
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import ClassVar, Iterable, Literal
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIResponseValidationError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -27,6 +39,145 @@ RISK_VALUES = ("Low", "Medium", "High", "Critical")
 Status = Literal["Not started", "In progress", "Completed", "Blocked"]
 Priority = Literal["Low", "Medium", "High", "Critical"]
 RiskLevel = Literal["Low", "Medium", "High", "Critical"]
+OpenAIOperation = Literal["plan_generation", "progress_review"]
+OpenAIErrorCategory = Literal[
+    "authentication",
+    "insufficient_quota",
+    "model_access",
+    "network",
+    "invalid_request",
+    "validation",
+    "unknown",
+]
+
+OPENAI_ERROR_CATEGORIES = frozenset(
+    {
+        "authentication",
+        "insufficient_quota",
+        "model_access",
+        "network",
+        "invalid_request",
+        "validation",
+        "unknown",
+    }
+)
+
+
+@dataclass(frozen=True)
+class OpenAIExceptionMetadata:
+    """Safe diagnostic fields that may be written to application logs."""
+
+    exception_class: str
+    http_status_code: int | None
+    openai_error_code: str
+    requested_model: str
+    category: OpenAIErrorCategory
+
+
+class StructuredOutputValidationError(RuntimeError):
+    """Internal marker for a missing parsed structured response."""
+
+
+def _safe_log_token(value: object, *, fallback: str = "none") -> str:
+    """Return a bounded single-token value that cannot expose an API key."""
+
+    if value is None:
+        return fallback
+    candidate = str(value).strip()
+    if not candidate or "sk-" in candidate.casefold():
+        return fallback
+    sanitised = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", candidate)[:120]
+    if not sanitised or "sk-" in sanitised.casefold():
+        return fallback
+    return sanitised
+
+
+def _openai_error_code(error: Exception) -> object | None:
+    """Read only the SDK's dedicated error-code field, never its message."""
+
+    code = getattr(error, "code", None)
+    if code is not None:
+        return code
+
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return None
+    error_body = body.get("error", body)
+    if not isinstance(error_body, dict):
+        return None
+    return error_body.get("code") or error_body.get("type")
+
+
+def _classify_openai_exception(
+    error: Exception, status_code: int | None, error_code: str
+) -> OpenAIErrorCategory:
+    """Map SDK and validation failures to a small non-sensitive category set."""
+
+    normalised_code = error_code.casefold()
+    if isinstance(error, AIServiceError) and error.category in OPENAI_ERROR_CATEGORIES:
+        return error.category
+    if isinstance(error, AuthenticationError) or status_code == 401:
+        return "authentication"
+    if isinstance(error, RateLimitError) or status_code == 429:
+        return "insufficient_quota"
+    if (
+        isinstance(error, (PermissionDeniedError, NotFoundError))
+        or status_code in {403, 404}
+        or normalised_code in {"model_not_found", "model_access_denied"}
+    ):
+        return "model_access"
+    if isinstance(error, (APIConnectionError, APITimeoutError)):
+        return "network"
+    if isinstance(error, (BadRequestError,)) or status_code in {400, 422}:
+        return "invalid_request"
+    if isinstance(
+        error,
+        (ValidationError, APIResponseValidationError, StructuredOutputValidationError),
+    ):
+        return "validation"
+    return "unknown"
+
+
+def extract_openai_exception_metadata(
+    error: Exception, requested_model: str
+) -> OpenAIExceptionMetadata:
+    """Extract only approved, sanitised metadata from an OpenAI failure."""
+
+    raw_status = getattr(error, "status_code", None)
+    status_code = raw_status if isinstance(raw_status, int) else None
+    error_code = _safe_log_token(_openai_error_code(error))
+    category = _classify_openai_exception(error, status_code, error_code)
+    return OpenAIExceptionMetadata(
+        exception_class=_safe_log_token(type(error).__name__, fallback="Exception"),
+        http_status_code=status_code,
+        openai_error_code=error_code,
+        requested_model=_safe_log_token(requested_model, fallback="unspecified"),
+        category=category,
+    )
+
+
+def log_openai_failure(
+    operation: OpenAIOperation, error: Exception, requested_model: str
+) -> OpenAIExceptionMetadata:
+    """Write exactly one concise metadata-only diagnostic line to stderr."""
+
+    metadata = extract_openai_exception_metadata(error, requested_model)
+    status = (
+        str(metadata.http_status_code)
+        if metadata.http_status_code is not None
+        else "none"
+    )
+    print(
+        f"operation={operation}"
+        f" exception_class={metadata.exception_class}"
+        f" http_status_code={status}"
+        f" openai_error_code={metadata.openai_error_code}"
+        f" requested_model={metadata.requested_model}"
+        f" category={metadata.category}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return metadata
 
 
 def safe_bound_text(value: str, max_characters: int) -> str:
@@ -269,6 +420,17 @@ class ProgressReview(BoundedReviewModel):
 class AIServiceError(RuntimeError):
     """A safe, user-facing error raised for OpenAI service failures."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: OpenAIErrorCategory = "unknown",
+        diagnostic_logged: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.diagnostic_logged = diagnostic_logged
+
 
 PLAN_INSTRUCTIONS = """You are an operations copilot for volunteer organisations,
 student societies, and non-profit teams. Create a practical event operations plan in
@@ -333,8 +495,23 @@ def has_api_key() -> bool:
 def _openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise AIServiceError("OPENAI_API_KEY is not configured.")
+        raise AIServiceError(
+            "OPENAI_API_KEY is not configured.", category="authentication"
+        )
     return OpenAI(api_key=api_key, timeout=90.0, max_retries=2)
+
+
+def _logged_service_error(
+    operation: OpenAIOperation, error: Exception, safe_message: str
+) -> AIServiceError:
+    """Log approved metadata once and return a safe application exception."""
+
+    metadata = log_openai_failure(operation, error, get_model_name())
+    return AIServiceError(
+        safe_message,
+        category=metadata.category,
+        diagnostic_logged=True,
+    )
 
 
 def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
@@ -356,9 +533,8 @@ def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
         )
         parsed = response.output_parsed
         if parsed is None:
-            status = getattr(response, "status", "unknown")
-            raise AIServiceError(
-                f"OpenAI returned no structured plan (response status: {status})."
+            raise StructuredOutputValidationError(
+                "OpenAI returned no parsed structured plan."
             )
         plan = (
             parsed
@@ -366,16 +542,25 @@ def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
             else OperationsPlan.model_validate(parsed)
         )
         return plan.model_copy(update={"event_brief": brief})
-    except AIServiceError:
-        raise
+    except AIServiceError as exc:
+        if exc.diagnostic_logged:
+            raise
+        raise _logged_service_error(
+            "plan_generation",
+            exc,
+            "The OpenAI request could not be completed.",
+        ) from exc
     except ValidationError as exc:
-        raise AIServiceError(
-            "OpenAI returned a plan that did not pass schema validation."
+        raise _logged_service_error(
+            "plan_generation",
+            exc,
+            "OpenAI returned a plan that did not pass schema validation.",
         ) from exc
     except Exception as exc:
-        raise AIServiceError(
-            "The OpenAI request could not be completed. Check the API key, model "
-            "access, network connection, and account limits."
+        raise _logged_service_error(
+            "plan_generation",
+            exc,
+            "The OpenAI request could not be completed.",
         ) from exc
 
 
@@ -409,9 +594,8 @@ def review_current_progress(
         )
         parsed = response.output_parsed
         if parsed is None:
-            status = getattr(response, "status", "unknown")
-            raise AIServiceError(
-                f"OpenAI returned no structured review (response status: {status})."
+            raise StructuredOutputValidationError(
+                "OpenAI returned no parsed structured review."
             )
         validated_review = (
             parsed
@@ -425,16 +609,25 @@ def review_current_progress(
                 "ownership_gaps": deterministic_analysis.ownership_gaps,
             }
         )
-    except AIServiceError:
-        raise
+    except AIServiceError as exc:
+        if exc.diagnostic_logged:
+            raise
+        raise _logged_service_error(
+            "progress_review",
+            exc,
+            "The progress review request could not be completed.",
+        ) from exc
     except ValidationError as exc:
-        raise AIServiceError(
-            "OpenAI returned a progress review that did not pass schema validation."
+        raise _logged_service_error(
+            "progress_review",
+            exc,
+            "OpenAI returned a progress review that did not pass schema validation.",
         ) from exc
     except Exception as exc:
-        raise AIServiceError(
-            "The progress review request could not be completed. Check the API key, "
-            "model access, network connection, and account limits."
+        raise _logged_service_error(
+            "progress_review",
+            exc,
+            "The progress review request could not be completed.",
         ) from exc
 
 

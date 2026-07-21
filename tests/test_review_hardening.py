@@ -153,11 +153,13 @@ def test_application_boundary_sanitises_unexpected_review_error(
 
     rendered_errors = " ".join(str(error.value) for error in app.error)
     assert not app.exception
-    assert "The AI progress review could not be completed." in rendered_errors
+    assert rendered_errors == (
+        "The OpenAI request failed. Error category: unknown. "
+        "The deterministic plan remains available."
+    )
     assert "SENSITIVE_MARKER" not in rendered_errors
     assert "Traceback" not in rendered_errors
     assert "C:\\private" not in rendered_errors
     assert app.session_state["review_source"] == (
         "Demo fallback after unexpected review error"
     )
-
