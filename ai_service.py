@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
+import sys
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import ClassVar, Iterable, Literal
+from time import monotonic
+from typing import Annotated, Callable, ClassVar, Iterable, Literal, TypeVar
 
-from openai import OpenAI
+import httpx
+from openai import (
+    APIConnectionError,
+    APIResponseValidationError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -24,9 +39,172 @@ STATUS_VALUES = ("Not started", "In progress", "Completed", "Blocked")
 PRIORITY_VALUES = ("Low", "Medium", "High", "Critical")
 RISK_VALUES = ("Low", "Medium", "High", "Critical")
 
+OPENAI_CONNECT_TIMEOUT_SECONDS = 15.0
+OPENAI_READ_TIMEOUT_SECONDS = 180.0
+OPENAI_WRITE_TIMEOUT_SECONDS = 30.0
+OPENAI_POOL_TIMEOUT_SECONDS = 30.0
+OPENAI_TIMEOUT_DEFAULT_SECONDS = 195.0
+OPENAI_MAX_RETRIES = 0
+OPENAI_CONTROLLED_TIMEOUT_RETRIES = 1
+OPENAI_HTTP_TIMEOUT = httpx.Timeout(
+    timeout=OPENAI_TIMEOUT_DEFAULT_SECONDS,
+    connect=OPENAI_CONNECT_TIMEOUT_SECONDS,
+    read=OPENAI_READ_TIMEOUT_SECONDS,
+    write=OPENAI_WRITE_TIMEOUT_SECONDS,
+    pool=OPENAI_POOL_TIMEOUT_SECONDS,
+)
+PLAN_REASONING_EFFORT = "low"
+PLAN_MAX_OUTPUT_TOKENS = 10_000
+
 Status = Literal["Not started", "In progress", "Completed", "Blocked"]
 Priority = Literal["Low", "Medium", "High", "Critical"]
 RiskLevel = Literal["Low", "Medium", "High", "Critical"]
+OpenAIOperation = Literal["plan_generation", "progress_review"]
+OpenAIErrorCategory = Literal[
+    "authentication",
+    "insufficient_quota",
+    "model_access",
+    "network",
+    "invalid_request",
+    "validation",
+    "unknown",
+]
+ResponseT = TypeVar("ResponseT")
+
+OPENAI_ERROR_CATEGORIES = frozenset(
+    {
+        "authentication",
+        "insufficient_quota",
+        "model_access",
+        "network",
+        "invalid_request",
+        "validation",
+        "unknown",
+    }
+)
+
+
+@dataclass(frozen=True)
+class OpenAIExceptionMetadata:
+    """Safe diagnostic fields that may be written to application logs."""
+
+    exception_class: str
+    http_status_code: int | None
+    openai_error_code: str
+    requested_model: str
+    category: OpenAIErrorCategory
+
+
+class StructuredOutputValidationError(RuntimeError):
+    """Internal marker for a missing parsed structured response."""
+
+
+def _safe_log_token(value: object, *, fallback: str = "none") -> str:
+    """Return a bounded single-token value that cannot expose an API key."""
+
+    if value is None:
+        return fallback
+    candidate = str(value).strip()
+    if not candidate or "sk-" in candidate.casefold():
+        return fallback
+    sanitised = re.sub(r"[^A-Za-z0-9_.:/-]+", "_", candidate)[:120]
+    if not sanitised or "sk-" in sanitised.casefold():
+        return fallback
+    return sanitised
+
+
+def _openai_error_code(error: Exception) -> object | None:
+    """Read only the SDK's dedicated error-code field, never its message."""
+
+    code = getattr(error, "code", None)
+    if code is not None:
+        return code
+
+    body = getattr(error, "body", None)
+    if not isinstance(body, dict):
+        return None
+    error_body = body.get("error", body)
+    if not isinstance(error_body, dict):
+        return None
+    return error_body.get("code") or error_body.get("type")
+
+
+def _classify_openai_exception(
+    error: Exception, status_code: int | None, error_code: str
+) -> OpenAIErrorCategory:
+    """Map SDK and validation failures to a small non-sensitive category set."""
+
+    normalised_code = error_code.casefold()
+    if isinstance(error, AIServiceError) and error.category in OPENAI_ERROR_CATEGORIES:
+        return error.category
+    if isinstance(error, AuthenticationError) or status_code == 401:
+        return "authentication"
+    if isinstance(error, RateLimitError) or status_code == 429:
+        return "insufficient_quota"
+    if (
+        isinstance(error, (PermissionDeniedError, NotFoundError))
+        or status_code in {403, 404}
+        or normalised_code in {"model_not_found", "model_access_denied"}
+    ):
+        return "model_access"
+    if isinstance(error, (APIConnectionError, APITimeoutError)):
+        return "network"
+    if isinstance(error, (BadRequestError,)) or status_code in {400, 422}:
+        return "invalid_request"
+    if isinstance(
+        error,
+        (ValidationError, APIResponseValidationError, StructuredOutputValidationError),
+    ):
+        return "validation"
+    return "unknown"
+
+
+def extract_openai_exception_metadata(
+    error: Exception, requested_model: str
+) -> OpenAIExceptionMetadata:
+    """Extract only approved, sanitised metadata from an OpenAI failure."""
+
+    raw_status = getattr(error, "status_code", None)
+    status_code = raw_status if isinstance(raw_status, int) else None
+    error_code = _safe_log_token(_openai_error_code(error))
+    category = _classify_openai_exception(error, status_code, error_code)
+    return OpenAIExceptionMetadata(
+        exception_class=_safe_log_token(type(error).__name__, fallback="Exception"),
+        http_status_code=status_code,
+        openai_error_code=error_code,
+        requested_model=_safe_log_token(requested_model, fallback="unspecified"),
+        category=category,
+    )
+
+
+def log_openai_failure(
+    operation: OpenAIOperation,
+    error: Exception,
+    requested_model: str,
+    *,
+    attempt_number: int = 1,
+    elapsed_seconds: float = 0.0,
+) -> OpenAIExceptionMetadata:
+    """Write exactly one concise metadata-only diagnostic line to stderr."""
+
+    metadata = extract_openai_exception_metadata(error, requested_model)
+    safe_attempt = attempt_number if attempt_number in {1, 2} else 1
+    safe_elapsed = (
+        elapsed_seconds
+        if math.isfinite(elapsed_seconds) and elapsed_seconds >= 0
+        else 0.0
+    )
+    print(
+        f"operation={operation}"
+        f" exception_class={metadata.exception_class}"
+        f" category={metadata.category}"
+        f" requested_model={metadata.requested_model}"
+        f" attempt_number={safe_attempt}"
+        f" elapsed_seconds={safe_elapsed:.2f}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return metadata
 
 
 def safe_bound_text(value: str, max_characters: int) -> str:
@@ -114,17 +292,17 @@ class EventBrief(StrictModel):
 
 class CommitteeRole(StrictModel):
     role: str = Field(min_length=2, max_length=120)
-    purpose: str = Field(min_length=5, max_length=500)
+    purpose: str = Field(min_length=5, max_length=300)
     suggested_people: int = Field(ge=1, le=100)
 
 
 class ActionableTask(StrictModel):
-    task: str = Field(min_length=3, max_length=240)
+    task: str = Field(min_length=3, max_length=180)
     person_in_charge_role: str = Field(max_length=120)
     deadline: date
     priority: Priority
     current_status: Status
-    task_dependencies: list[str] = Field(max_length=20)
+    task_dependencies: list[str] = Field(max_length=5)
     operational_risk_level: RiskLevel
 
     @field_validator("task_dependencies")
@@ -134,24 +312,29 @@ class ActionableTask(StrictModel):
 
 
 class RiskRegisterEntry(StrictModel):
-    risk: str = Field(min_length=3, max_length=300)
+    risk: str = Field(min_length=3, max_length=240)
     likelihood: RiskLevel
     impact: RiskLevel
     overall_level: RiskLevel
-    mitigation: str = Field(min_length=5, max_length=700)
+    mitigation: str = Field(min_length=5, max_length=400)
     owner_role: str = Field(min_length=1, max_length=120)
+
+
+NextActionText = Annotated[str, Field(min_length=5, max_length=300)]
 
 
 class OperationsPlan(StrictModel):
     event_brief: EventBrief
-    plan_summary: str = Field(min_length=20, max_length=1_500)
+    plan_summary: str = Field(min_length=20, max_length=800)
     recommended_committee_structure: list[CommitteeRole] = Field(
-        min_length=1, max_length=30
+        min_length=1, max_length=10
     )
-    actionable_tasks: list[ActionableTask] = Field(min_length=1, max_length=100)
+    actionable_tasks: list[ActionableTask] = Field(min_length=12, max_length=16)
     operational_risk_level: RiskLevel
-    risk_register: list[RiskRegisterEntry] = Field(min_length=1, max_length=50)
-    recommended_next_actions: list[str] = Field(min_length=1, max_length=20)
+    risk_register: list[RiskRegisterEntry] = Field(min_length=1, max_length=6)
+    recommended_next_actions: list[NextActionText] = Field(
+        min_length=1, max_length=5
+    )
 
 
 class UrgentAction(BoundedReviewModel):
@@ -269,15 +452,33 @@ class ProgressReview(BoundedReviewModel):
 class AIServiceError(RuntimeError):
     """A safe, user-facing error raised for OpenAI service failures."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: OpenAIErrorCategory = "unknown",
+        diagnostic_logged: bool = False,
+        timed_out: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.diagnostic_logged = diagnostic_logged
+        self.timed_out = timed_out
 
-PLAN_INSTRUCTIONS = """You are an operations copilot for volunteer organisations,
-student societies, and non-profit teams. Create a practical event operations plan in
-British English. Preserve every supplied event detail exactly. Make tasks specific,
-assign each task to a committee role, use ISO dates, include concrete dependencies,
-and surface risks early. The recommended committee headcount should be realistic for
-the supplied committee size. Do not invent external integrations or claim that an
-approval, supplier, booking, or payment has already been completed. Return only the
-structured result requested by the schema."""
+
+PLAN_INSTRUCTIONS = """Create a concise, practical event operations plan in British
+English for the supplied volunteer, student-society, or non-profit event brief.
+Preserve the supplied facts and fit role names and headcount to the organisation type.
+
+Return 12–16 specific operational tasks, no more than 10 committee roles, no more than
+6 material risks, and no more than 5 immediate next actions. Assign one responsible
+role and an ISO deadline to every task. List only direct prerequisites, with no full
+transitive dependency lists. Keep summaries, role purposes, risks, mitigations, and
+actions concise.
+
+For a newly generated plan, mark the first governance task In progress and every other
+task Not started. Do not claim that approvals, bookings, suppliers, payments, or
+integrations are complete. Return only the structured result required by the schema."""
 
 
 REVIEW_INSTRUCTIONS = """You are reviewing the live, user-edited operations dashboard
@@ -333,32 +534,117 @@ def has_api_key() -> bool:
 def _openai_client() -> OpenAI:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise AIServiceError("OPENAI_API_KEY is not configured.")
-    return OpenAI(api_key=api_key, timeout=90.0, max_retries=2)
+        raise AIServiceError(
+            "OPENAI_API_KEY is not configured.", category="authentication"
+        )
+    return OpenAI(
+        api_key=api_key,
+        timeout=OPENAI_HTTP_TIMEOUT,
+        max_retries=OPENAI_MAX_RETRIES,
+    )
+
+
+def _logged_service_error(
+    operation: OpenAIOperation,
+    error: Exception,
+    safe_message: str,
+    *,
+    attempt_number: int = 1,
+    elapsed_seconds: float = 0.0,
+) -> AIServiceError:
+    """Log approved metadata once and return a safe application exception."""
+
+    metadata = log_openai_failure(
+        operation,
+        error,
+        get_model_name(),
+        attempt_number=attempt_number,
+        elapsed_seconds=elapsed_seconds,
+    )
+    return AIServiceError(
+        safe_message,
+        category=metadata.category,
+        diagnostic_logged=True,
+    )
+
+
+def _request_with_timeout_retry(
+    operation: OpenAIOperation,
+    request: Callable[[], ResponseT],
+) -> tuple[ResponseT, int, float]:
+    """Run a request with no SDK retries and one explicit timeout-only retry."""
+
+    total_attempts = 1 + OPENAI_CONTROLLED_TIMEOUT_RETRIES
+    for attempt_number in range(1, total_attempts + 1):
+        attempt_started = monotonic()
+        try:
+            response = request()
+            return response, attempt_number, monotonic() - attempt_started
+        except APITimeoutError as exc:
+            elapsed_seconds = monotonic() - attempt_started
+            metadata = log_openai_failure(
+                operation,
+                exc,
+                get_model_name(),
+                attempt_number=attempt_number,
+                elapsed_seconds=elapsed_seconds,
+            )
+            if attempt_number < total_attempts:
+                continue
+            raise AIServiceError(
+                "The live AI request timed out.",
+                category=metadata.category,
+                diagnostic_logged=True,
+                timed_out=True,
+            ) from exc
+        except Exception as exc:
+            elapsed_seconds = monotonic() - attempt_started
+            metadata = log_openai_failure(
+                operation,
+                exc,
+                get_model_name(),
+                attempt_number=attempt_number,
+                elapsed_seconds=elapsed_seconds,
+            )
+            raise AIServiceError(
+                "The OpenAI request could not be completed.",
+                category=metadata.category,
+                diagnostic_logged=True,
+            ) from exc
+
+    raise RuntimeError("OpenAI request attempt loop ended unexpectedly.")
 
 
 def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
     """Generate and validate an operations plan with the Responses API."""
 
+    request_started = monotonic()
+    attempt_number = 1
+    request_elapsed = 0.0
     try:
-        response = _openai_client().responses.parse(
-            model=get_model_name(),
-            input=[
-                {"role": "system", "content": PLAN_INSTRUCTIONS},
-                {
-                    "role": "user",
-                    "content": "Create an operations plan for this validated event brief:\n"
-                    + json.dumps(brief.model_dump(mode="json"), ensure_ascii=False),
-                },
-            ],
-            reasoning={"effort": "medium"},
-            text_format=OperationsPlan,
+        client = _openai_client()
+        response, attempt_number, request_elapsed = _request_with_timeout_retry(
+            "plan_generation",
+            lambda: client.responses.parse(
+                model=get_model_name(),
+                input=[
+                    {"role": "system", "content": PLAN_INSTRUCTIONS},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            brief.model_dump(mode="json"), ensure_ascii=False
+                        ),
+                    },
+                ],
+                reasoning={"effort": PLAN_REASONING_EFFORT},
+                max_output_tokens=PLAN_MAX_OUTPUT_TOKENS,
+                text_format=OperationsPlan,
+            ),
         )
         parsed = response.output_parsed
         if parsed is None:
-            status = getattr(response, "status", "unknown")
-            raise AIServiceError(
-                f"OpenAI returned no structured plan (response status: {status})."
+            raise StructuredOutputValidationError(
+                "OpenAI returned no parsed structured plan."
             )
         plan = (
             parsed
@@ -366,16 +652,31 @@ def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
             else OperationsPlan.model_validate(parsed)
         )
         return plan.model_copy(update={"event_brief": brief})
-    except AIServiceError:
-        raise
+    except AIServiceError as exc:
+        if exc.diagnostic_logged:
+            raise
+        raise _logged_service_error(
+            "plan_generation",
+            exc,
+            "The OpenAI request could not be completed.",
+            attempt_number=attempt_number,
+            elapsed_seconds=request_elapsed or monotonic() - request_started,
+        ) from exc
     except ValidationError as exc:
-        raise AIServiceError(
-            "OpenAI returned a plan that did not pass schema validation."
+        raise _logged_service_error(
+            "plan_generation",
+            exc,
+            "OpenAI returned a plan that did not pass schema validation.",
+            attempt_number=attempt_number,
+            elapsed_seconds=request_elapsed or monotonic() - request_started,
         ) from exc
     except Exception as exc:
-        raise AIServiceError(
-            "The OpenAI request could not be completed. Check the API key, model "
-            "access, network connection, and account limits."
+        raise _logged_service_error(
+            "plan_generation",
+            exc,
+            "The OpenAI request could not be completed.",
+            attempt_number=attempt_number,
+            elapsed_seconds=request_elapsed or monotonic() - request_started,
         ) from exc
 
 
@@ -393,25 +694,31 @@ def review_current_progress(
             mode="json"
         ),
     }
+    request_started = monotonic()
+    attempt_number = 1
+    request_elapsed = 0.0
     try:
-        response = _openai_client().responses.parse(
-            model=get_model_name(),
-            input=[
-                {"role": "system", "content": REVIEW_INSTRUCTIONS},
-                {
-                    "role": "user",
-                    "content": "Review this current dashboard state:\n"
-                    + json.dumps(payload, ensure_ascii=False),
-                },
-            ],
-            reasoning={"effort": "medium"},
-            text_format=ProgressReview,
+        client = _openai_client()
+        response, attempt_number, request_elapsed = _request_with_timeout_retry(
+            "progress_review",
+            lambda: client.responses.parse(
+                model=get_model_name(),
+                input=[
+                    {"role": "system", "content": REVIEW_INSTRUCTIONS},
+                    {
+                        "role": "user",
+                        "content": "Review this current dashboard state:\n"
+                        + json.dumps(payload, ensure_ascii=False),
+                    },
+                ],
+                reasoning={"effort": "medium"},
+                text_format=ProgressReview,
+            ),
         )
         parsed = response.output_parsed
         if parsed is None:
-            status = getattr(response, "status", "unknown")
-            raise AIServiceError(
-                f"OpenAI returned no structured review (response status: {status})."
+            raise StructuredOutputValidationError(
+                "OpenAI returned no parsed structured review."
             )
         validated_review = (
             parsed
@@ -425,16 +732,31 @@ def review_current_progress(
                 "ownership_gaps": deterministic_analysis.ownership_gaps,
             }
         )
-    except AIServiceError:
-        raise
+    except AIServiceError as exc:
+        if exc.diagnostic_logged:
+            raise
+        raise _logged_service_error(
+            "progress_review",
+            exc,
+            "The progress review request could not be completed.",
+            attempt_number=attempt_number,
+            elapsed_seconds=request_elapsed or monotonic() - request_started,
+        ) from exc
     except ValidationError as exc:
-        raise AIServiceError(
-            "OpenAI returned a progress review that did not pass schema validation."
+        raise _logged_service_error(
+            "progress_review",
+            exc,
+            "OpenAI returned a progress review that did not pass schema validation.",
+            attempt_number=attempt_number,
+            elapsed_seconds=request_elapsed or monotonic() - request_started,
         ) from exc
     except Exception as exc:
-        raise AIServiceError(
-            "The progress review request could not be completed. Check the API key, "
-            "model access, network connection, and account limits."
+        raise _logged_service_error(
+            "progress_review",
+            exc,
+            "The progress review request could not be completed.",
+            attempt_number=attempt_number,
+            elapsed_seconds=request_elapsed or monotonic() - request_started,
         ) from exc
 
 
@@ -786,14 +1108,6 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             overall_level="High",
             mitigation="Use approved rubrics, judge calibration, signed score sheets, a verification step, and a time-limited dispute route.",
             owner_role=programme_lead,
-        ),
-        RiskRegisterEntry(
-            risk="Late procurement or cost growth exceeds the available budget",
-            likelihood="Medium",
-            impact="High",
-            overall_level="High",
-            mitigation="Maintain an itemised budget, require approval thresholds, confirm quotes, keep a contingency reserve, and review weekly.",
-            owner_role=finance_lead,
         ),
         RiskRegisterEntry(
             risk="Insufficient volunteer coverage leaves critical posts unattended",

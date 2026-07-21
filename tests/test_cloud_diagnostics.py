@@ -98,7 +98,13 @@ def test_pydantic_validation_error_maps_to_validation() -> None:
 def test_log_line_contains_only_safe_metadata(capsys: pytest.CaptureFixture[str]) -> None:
     error = _status_error(AuthenticationError, 401, "invalid_api_key")
 
-    log_openai_failure("plan_generation", error, "gpt-5.6-sol")
+    log_openai_failure(
+        "plan_generation",
+        error,
+        "gpt-5.6-sol",
+        attempt_number=2,
+        elapsed_seconds=123.456,
+    )
     captured = capsys.readouterr()
     log_lines = [line for line in captured.err.splitlines() if line]
 
@@ -108,10 +114,10 @@ def test_log_line_contains_only_safe_metadata(capsys: pytest.CaptureFixture[str]
     assert fields == [
         "operation=plan_generation",
         "exception_class=AuthenticationError",
-        "http_status_code=401",
-        "openai_error_code=invalid_api_key",
-        "requested_model=gpt-5.6-sol",
         "category=authentication",
+        "requested_model=gpt-5.6-sol",
+        "attempt_number=2",
+        "elapsed_seconds=123.46",
     ]
     prohibited = (
         "sk-",
@@ -120,6 +126,9 @@ def test_log_line_contains_only_safe_metadata(capsys: pytest.CaptureFixture[str]
         "Traceback",
         "credential",
         "request_headers",
+        "invalid_api_key",
+        "http_status_code",
+        "openai_error_code",
     )
     assert all(item not in log_lines[0] for item in prohibited)
     assert captured.out == ""

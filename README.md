@@ -2,7 +2,12 @@
 
 CivicOps AI is an AI operations copilot for volunteer organisations, student societies, and non-profit teams. It turns a short event brief into a validated, editable operating plan with accountable owners, deadlines, dependencies, risks, progress reviews, and portable exports.
 
-This repository is a complete local Streamlit MVP prepared as an OpenAI Build Week submission.
+This repository contains a deployed Streamlit MVP that can also be run locally, prepared as an OpenAI Build Week submission.
+
+## Live project
+
+- **Public demo:** https://civicops-ai-build-week.streamlit.app
+- **Demo video:** https://youtu.be/Luz5fzLp4Zo
 
 ## The social problem
 
@@ -96,13 +101,13 @@ The app never displays or hardcodes the key. `.env` and Streamlit secrets are ex
 
 ## How GPT-5.6 is used
 
-The default model is the explicit GPT-5.6 flagship identifier `gpt-5.6-sol`. OpenAI also documents `gpt-5.6` as an alias that routes to Sol. The integration uses the current Python Responses API structured-output pattern:
+The default model is the explicit model identifier `gpt-5.6-sol`. The integration uses the OpenAI Responses API with structured Pydantic outputs:
 
 ```python
 response = client.responses.parse(
     model="gpt-5.6-sol",
     input=[...],
-    reasoning={"effort": "medium"},
+    reasoning={"effort": "low"},
     text_format=OperationsPlan,
 )
 plan = response.output_parsed
@@ -114,9 +119,41 @@ The application validates the parsed object again before using it. The same appr
 
 ## How Codex contributed
 
-Codex helped translate the product brief into the working architecture, verified the current OpenAI API integration against official documentation, implemented the Streamlit interface and local fallback, created validation schemas and tests, and exercised the Demo Mode and startup path. This is a development contribution statement, not a claim that Codex operates the deployed application.
+Codex was used as the primary engineering partner throughout the project.
+
+It helped:
+
+- Translate the original product brief into an MVP architecture
+- Scaffold the Streamlit interface and application workflow
+- Design the Pydantic schemas for operations plans and progress reviews
+- Integrate the OpenAI Responses API with GPT-5.6 Sol
+- Implement deterministic fallback planning and review logic
+- Build task dependency, urgency-scoring, and dashboard transformation logic
+- Generate and improve automated tests
+- Diagnose structured-output validation failures
+- Investigate differences between local and Streamlit Community Cloud behaviour
+- Add sanitised cloud diagnostics without exposing credentials or tracebacks
+- Identify the original 90-second API timeout and hidden retry behaviour
+- Configure a 180-second read timeout with one controlled retry for `APITimeoutError`
+- Reduce request latency by tightening output limits and using low reasoning effort
+- Prepare clean deployment copies that excluded `.env`, Git metadata, virtual environments, caches, logs, and credentials
+
+Codex was especially valuable during cloud deployment. When the application worked locally but timed out on Streamlit Community Cloud, Codex helped inspect the actual SDK configuration, add safe diagnostics, identify the timeout failure, implement controlled recovery, and verify the final result with automated tests.
+
+Codex assisted with implementation and debugging, while the product concept, event context, operational requirements, testing decisions, and final deployment choices were directed and reviewed by the developer.
 
 ## Testing
+
+The final implementation passed **39 automated tests** covering:
+
+- Core deterministic planning
+- Dashboard edits and metrics
+- Structured plan and progress-review validation
+- Sanitised cloud diagnostics
+- Safe user-facing error handling
+- Timeout configuration
+- Controlled retry behaviour
+- Prevention of secret or traceback exposure
 
 Run all offline tests:
 
