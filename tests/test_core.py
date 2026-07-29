@@ -73,6 +73,7 @@ def test_dashboard_round_trip_preserves_tasks() -> None:
     rebuilt = dashboard_rows_to_tasks(rows)
 
     assert list(rows[0]) == [
+        "task_id",
         "task",
         "PIC",
         "deadline",
@@ -80,6 +81,7 @@ def test_dashboard_round_trip_preserves_tasks() -> None:
         "priority",
         "risk",
         "dependency",
+        "task_phase",
     ]
     assert rebuilt == plan.actionable_tasks
 

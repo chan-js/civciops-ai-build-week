@@ -12,6 +12,7 @@ SAMPLE_EVENT: dict[str, object] = {
         "Run a safe, educational, and well-coordinated inter-school competition that "
         "strengthens foot drill discipline and practical first-aid knowledge."
     ),
+    "current_planning_date": date.today(),
     "event_date": date(2026, 10, 18),
     "venue": "SJK(C) Bacang, Melaka",
     "expected_participants": 70,

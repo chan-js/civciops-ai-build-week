@@ -127,7 +127,9 @@ def test_fresh_demo_flow_uses_latest_edits_and_exposes_exports(
     assert metric_values["Blocked"] == "1"
     assert metric_values["Completion"] == "6%"
 
-    app.button[2].click().run()
+    next(
+        button for button in app.button if button.label == "Review Current Progress"
+    ).click().run()
     assert not app.exception
     review = app.session_state["progress_review"]
     assert "1 of 16 tasks are complete" in review.executive_summary
@@ -157,7 +159,9 @@ def test_new_plan_and_sample_reload_clear_stale_editor_and_review_state(
         "deleted_rows": [],
     }
     app.run()
-    app.button[2].click().run()
+    next(
+        button for button in app.button if button.label == "Review Current Progress"
+    ).click().run()
     assert app.session_state["progress_review"] is not None
 
     app.button[1].click().run()
