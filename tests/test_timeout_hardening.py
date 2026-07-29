@@ -21,6 +21,7 @@ from ai_service import (
     OPENAI_READ_TIMEOUT_SECONDS,
     OPENAI_TIMEOUT_DEFAULT_SECONDS,
     OPENAI_WRITE_TIMEOUT_SECONDS,
+    GeneratedOperationsPlan,
     OperationsPlan,
     PLAN_INSTRUCTIONS,
     PLAN_MAX_OUTPUT_TOKENS,
@@ -157,7 +158,7 @@ def test_plan_request_and_output_are_bounded(
     )
 
     plan = generate_operations_plan(brief)
-    schema = OperationsPlan.model_json_schema()["properties"]
+    schema = GeneratedOperationsPlan.model_json_schema()["properties"]
     prompt = " ".join(PLAN_INSTRUCTIONS.split())
     request_input = captured["input"]
 
@@ -177,6 +178,9 @@ def test_plan_request_and_output_are_bounded(
     assert "12–16 specific operational tasks" in prompt
     assert "only direct prerequisites" in prompt
     assert "no full transitive dependency lists" in prompt
+    assert "current_planning_date is authoritative" in prompt
+    assert "Never combine event delivery with post-event reporting" in prompt
+    assert captured["text_format"] is GeneratedOperationsPlan
     assert isinstance(request_input, list)
     assert len(request_input) == 2
     assert json.loads(request_input[1]["content"]) == brief.model_dump(mode="json")

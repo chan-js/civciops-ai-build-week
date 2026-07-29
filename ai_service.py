@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from time import monotonic
 from typing import Annotated, Callable, ClassVar, Iterable, Literal, TypeVar
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import httpx
 from openai import (
@@ -31,6 +32,7 @@ from pydantic import (
     ValidationError,
     ValidationInfo,
     field_validator,
+    model_validator,
 )
 
 
@@ -59,6 +61,7 @@ PLAN_MAX_OUTPUT_TOKENS = 10_000
 Status = Literal["Not started", "In progress", "Completed", "Blocked"]
 Priority = Literal["Low", "Medium", "High", "Critical"]
 RiskLevel = Literal["Low", "Medium", "High", "Critical"]
+TaskPhase = Literal["Pre-event", "Event-day delivery", "Post-event closeout"]
 OpenAIOperation = Literal["plan_generation", "progress_review"]
 OpenAIErrorCategory = Literal[
     "authentication",
@@ -261,6 +264,7 @@ class EventBrief(StrictModel):
     organisation_type: str = Field(min_length=2, max_length=120)
     event_name: str = Field(min_length=3, max_length=180)
     event_objective: str = Field(min_length=10, max_length=1_500)
+    current_planning_date: date = Field(default_factory=date.today)
     event_date: date
     venue: str = Field(min_length=2, max_length=200)
     expected_participants: int = Field(ge=1, le=100_000)
@@ -282,12 +286,14 @@ class EventBrief(StrictModel):
     def strip_text(cls, value: object) -> object:
         return value.strip() if isinstance(value, str) else value
 
-    @field_validator("event_date")
-    @classmethod
-    def event_must_not_be_in_the_past(cls, value: date) -> date:
-        if value < date.today():
-            raise ValueError("Event date must be today or a future date.")
-        return value
+    @model_validator(mode="after")
+    def event_must_not_precede_planning_date(self) -> EventBrief:
+        if self.event_date < self.current_planning_date:
+            raise ValueError(
+                "Event date must be today or a future date relative to the current "
+                "planning date."
+            )
+        return self
 
 
 class CommitteeRole(StrictModel):
@@ -297,6 +303,7 @@ class CommitteeRole(StrictModel):
 
 
 class ActionableTask(StrictModel):
+    task_id: str = Field(default="", max_length=64)
     task: str = Field(min_length=3, max_length=180)
     person_in_charge_role: str = Field(max_length=120)
     deadline: date
@@ -304,6 +311,12 @@ class ActionableTask(StrictModel):
     current_status: Status
     task_dependencies: list[str] = Field(max_length=5)
     operational_risk_level: RiskLevel
+    task_phase: TaskPhase = "Pre-event"
+
+    @field_validator("task_id", "task", "person_in_charge_role", mode="before")
+    @classmethod
+    def clean_task_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("task_dependencies")
     @classmethod
@@ -329,12 +342,51 @@ class OperationsPlan(StrictModel):
     recommended_committee_structure: list[CommitteeRole] = Field(
         min_length=1, max_length=10
     )
-    actionable_tasks: list[ActionableTask] = Field(min_length=12, max_length=16)
+    actionable_tasks: list[ActionableTask]
     operational_risk_level: RiskLevel
     risk_register: list[RiskRegisterEntry] = Field(min_length=1, max_length=6)
     recommended_next_actions: list[NextActionText] = Field(
         min_length=1, max_length=5
     )
+    deadline_corrections: list[str] = Field(default_factory=list, max_length=100)
+
+
+class GeneratedOperationsPlan(OperationsPlan):
+    """Bounded schema used only for AI output before dashboard edits."""
+
+    actionable_tasks: list[ActionableTask] = Field(min_length=12, max_length=16)
+
+    @model_validator(mode="after")
+    def require_separate_delivery_and_closeout(self) -> GeneratedOperationsPlan:
+        delivery_indexes = [
+            index
+            for index, task in enumerate(self.actionable_tasks)
+            if task.task_phase == "Event-day delivery"
+        ]
+        closeout_indexes = [
+            index
+            for index, task in enumerate(self.actionable_tasks)
+            if task.task_phase == "Post-event closeout"
+        ]
+        if len(delivery_indexes) != 1 or len(closeout_indexes) != 1:
+            raise ValueError(
+                "Generated plans must contain one event-day delivery task and one "
+                "separate post-event closeout task."
+            )
+        delivery_index = delivery_indexes[0]
+        closeout_index = closeout_indexes[0]
+        if delivery_index >= closeout_index:
+            raise ValueError(
+                "The post-event closeout task must follow the event-day delivery task."
+            )
+        if any(
+            task.task_phase == "Pre-event"
+            for task in self.actionable_tasks[delivery_index + 1 :]
+        ):
+            raise ValueError(
+                "Pre-event tasks must appear before event-day delivery and closeout."
+            )
+        return self
 
 
 class UrgentAction(BoundedReviewModel):
@@ -466,15 +518,39 @@ class AIServiceError(RuntimeError):
         self.timed_out = timed_out
 
 
+class TaskValidationError(ValueError):
+    """A safe validation error for edited dashboard task data."""
+
+
+@dataclass(frozen=True)
+class TaskDeletionResult:
+    """A plan mutation plus dependency references removed with the deleted task."""
+
+    plan: OperationsPlan
+    deleted_task_name: str
+    updated_dependent_tasks: tuple[str, ...]
+
+
 PLAN_INSTRUCTIONS = """Create a concise, practical event operations plan in British
 English for the supplied volunteer, student-society, or non-profit event brief.
 Preserve the supplied facts and fit role names and headcount to the organisation type.
 
 Return 12–16 specific operational tasks, no more than 10 committee roles, no more than
 6 material risks, and no more than 5 immediate next actions. Assign one responsible
-role and an ISO deadline to every task. List only direct prerequisites, with no full
-transitive dependency lists. Keep summaries, role purposes, risks, mitigations, and
-actions concise.
+role and an ISO deadline to every task. Give every task a unique opaque task_id. List
+only direct prerequisites, with no full transitive dependency lists. Keep summaries,
+role purposes, risks, mitigations, and actions concise.
+
+The supplied current_planning_date is authoritative. No Pre-event task deadline may be
+earlier than current_planning_date or later than event_date. Keep task deadlines in
+chronological order. Include exactly one task whose task_phase is "Event-day delivery";
+it must cover delivering or conducting the event and its deadline must equal event_date.
+Include exactly one later, separate task whose task_phase is "Post-event closeout"; its
+deadline must be after event_date. Closeout may include the financial report, income and
+expenditure statement, results reconciliation, equipment return, and post-event
+documentation. Never combine event delivery with post-event reporting or closeout in a
+single task. Set every other task_phase to "Pre-event". Set deadline_corrections to an
+empty list because the application performs its own deterministic safety check.
 
 For a newly generated plan, mark the first governance task In progress and every other
 task Not started. Do not claim that approvals, bookings, suppliers, payments, or
@@ -615,6 +691,134 @@ def _request_with_timeout_retry(
     raise RuntimeError("OpenAI request attempt loop ended unexpectedly.")
 
 
+def _new_task_id() -> str:
+    return f"task-{uuid4().hex}"
+
+
+def _deterministic_task_id(
+    brief: EventBrief, task: ActionableTask, index: int
+) -> str:
+    seed = (
+        f"civicops:{brief.event_name}:{brief.event_date.isoformat()}:"
+        f"{index}:{task.task}"
+    )
+    return f"task-{uuid5(NAMESPACE_URL, seed).hex}"
+
+
+def ensure_task_ids(
+    tasks: Iterable[ActionableTask],
+    *,
+    brief: EventBrief | None = None,
+    deterministic: bool = False,
+) -> list[ActionableTask]:
+    """Preserve valid IDs and safely replace missing or duplicate internal IDs."""
+
+    task_list = list(tasks)
+    used_ids: set[str] = set()
+    prepared: list[ActionableTask] = []
+    for index, task in enumerate(task_list):
+        task_id = task.task_id
+        if not task_id or task_id in used_ids:
+            task_id = (
+                _deterministic_task_id(brief, task, index)
+                if deterministic and brief is not None
+                else _new_task_id()
+            )
+            while task_id in used_ids:
+                task_id = _new_task_id()
+            task = task.model_copy(update={"task_id": task_id})
+        used_ids.add(task_id)
+        prepared.append(task)
+    return prepared
+
+
+def validate_task_deadlines(
+    brief: EventBrief, tasks: Iterable[ActionableTask]
+) -> None:
+    """Reject unsafe manually edited deadlines with a user-facing explanation."""
+
+    errors: list[str] = []
+    for task in tasks:
+        if task.task_phase == "Pre-event":
+            if task.deadline < brief.current_planning_date:
+                errors.append(
+                    f"“{task.task}” is due before the current planning date "
+                    f"({brief.current_planning_date.isoformat()})."
+                )
+            elif task.deadline > brief.event_date:
+                errors.append(
+                    f"“{task.task}” is a pre-event task due after the event date "
+                    f"({brief.event_date.isoformat()})."
+                )
+        elif task.task_phase == "Event-day delivery":
+            if task.deadline != brief.event_date:
+                errors.append(
+                    f"“{task.task}” is the event-day delivery task and must be due "
+                    f"on {brief.event_date.isoformat()}."
+                )
+        elif task.deadline <= brief.event_date:
+            errors.append(
+                f"“{task.task}” is a post-event closeout task and must be due "
+                f"after {brief.event_date.isoformat()}."
+            )
+    if errors:
+        raise TaskValidationError(" ".join(errors))
+
+
+def apply_generated_plan_safety(
+    plan: OperationsPlan,
+    brief: EventBrief,
+    *,
+    deterministic_ids: bool = False,
+) -> OperationsPlan:
+    """Apply the smallest deterministic deadline corrections to generated work."""
+
+    tasks = ensure_task_ids(
+        plan.actionable_tasks,
+        brief=brief,
+        deterministic=deterministic_ids,
+    )
+    corrections: list[str] = []
+    corrected_tasks: list[ActionableTask] = []
+    previous_pre_event_deadline = brief.current_planning_date
+
+    for task in tasks:
+        original_deadline = task.deadline
+        corrected_deadline = original_deadline
+        if task.task_phase == "Pre-event":
+            corrected_deadline = max(
+                original_deadline,
+                brief.current_planning_date,
+                previous_pre_event_deadline,
+            )
+            corrected_deadline = min(corrected_deadline, brief.event_date)
+            previous_pre_event_deadline = corrected_deadline
+        elif task.task_phase == "Event-day delivery":
+            corrected_deadline = brief.event_date
+        else:
+            corrected_deadline = max(
+                original_deadline, brief.event_date + timedelta(days=1)
+            )
+
+        if corrected_deadline != original_deadline:
+            corrections.append(
+                f"“{task.task}” moved from {original_deadline.isoformat()} to "
+                f"{corrected_deadline.isoformat()}."
+            )
+            task = task.model_copy(update={"deadline": corrected_deadline})
+        corrected_tasks.append(task)
+
+    validate_task_deadlines(brief, corrected_tasks)
+    return OperationsPlan.model_validate(
+        {
+            **plan.model_dump(mode="python"),
+            "event_brief": brief,
+            "actionable_tasks": corrected_tasks,
+            "deadline_corrections": corrections,
+        }
+    )
+
+
 def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
     """Generate and validate an operations plan with the Responses API."""
 
@@ -638,7 +842,7 @@ def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
                 ],
                 reasoning={"effort": PLAN_REASONING_EFFORT},
                 max_output_tokens=PLAN_MAX_OUTPUT_TOKENS,
-                text_format=OperationsPlan,
+                text_format=GeneratedOperationsPlan,
             ),
         )
         parsed = response.output_parsed
@@ -646,12 +850,16 @@ def generate_operations_plan(brief: EventBrief) -> OperationsPlan:
             raise StructuredOutputValidationError(
                 "OpenAI returned no parsed structured plan."
             )
-        plan = (
+        generated_plan = (
             parsed
-            if isinstance(parsed, OperationsPlan)
-            else OperationsPlan.model_validate(parsed)
+            if isinstance(parsed, GeneratedOperationsPlan)
+            else GeneratedOperationsPlan.model_validate(
+                parsed.model_dump(mode="python")
+                if isinstance(parsed, BaseModel)
+                else parsed
+            )
         )
-        return plan.model_copy(update={"event_brief": brief})
+        return apply_generated_plan_safety(generated_plan, brief)
     except AIServiceError as exc:
         if exc.diagnostic_logged:
             raise
@@ -1045,7 +1253,7 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             operational_risk_level="Low",
         ),
         ActionableTask(
-            task="Operate event command desk, check-ins, and incident log",
+            task="Deliver and conduct the event",
             person_in_charge_role=event_lead,
             deadline=event_date,
             priority="Critical",
@@ -1056,6 +1264,7 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
                 "Confirm suppliers, deliveries, petty cash, and final budget position",
             ],
             operational_risk_level="Critical",
+            task_phase="Event-day delivery",
         ),
         ActionableTask(
             task="Complete evaluation, financial reconciliation, and lessons review",
@@ -1063,8 +1272,9 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             deadline=event_date + timedelta(days=7),
             priority="Medium",
             current_status="Not started",
-            task_dependencies=["Operate event command desk, check-ins, and incident log"],
+            task_dependencies=["Deliver and conduct the event"],
             operational_risk_level="Low",
+            task_phase="Post-event closeout",
         ),
     ]
 
@@ -1120,7 +1330,7 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
     ]
 
     budget_text = f"RM{brief.available_budget:,.2f}"
-    return OperationsPlan(
+    plan = OperationsPlan(
         event_brief=brief,
         plan_summary=(
             f"A staged operations plan for {brief.event_name} at {brief.venue}, "
@@ -1141,6 +1351,7 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             "Protect a budget contingency and record every procurement commitment.",
         ],
     )
+    return apply_generated_plan_safety(plan, brief, deterministic_ids=True)
 
 
 def _is_unclear_owner(owner: str) -> bool:
@@ -1955,6 +2166,7 @@ def tasks_to_dashboard_rows(tasks: Iterable[ActionableTask]) -> list[dict[str, o
 
     return [
         {
+            "task_id": task.task_id,
             "task": task.task,
             "PIC": task.person_in_charge_role,
             "deadline": task.deadline,
@@ -1962,12 +2174,17 @@ def tasks_to_dashboard_rows(tasks: Iterable[ActionableTask]) -> list[dict[str, o
             "priority": task.priority,
             "risk": task.operational_risk_level,
             "dependency": "; ".join(task.task_dependencies),
+            "task_phase": task.task_phase,
         }
         for task in tasks
     ]
 
 
-def dashboard_rows_to_tasks(rows: Iterable[dict[str, object]]) -> list[ActionableTask]:
+def dashboard_rows_to_tasks(
+    rows: Iterable[dict[str, object]],
+    *,
+    brief: EventBrief | None = None,
+) -> list[ActionableTask]:
     """Validate user-edited dashboard rows back into the canonical task model."""
 
     tasks: list[ActionableTask] = []
@@ -1976,6 +2193,7 @@ def dashboard_rows_to_tasks(rows: Iterable[dict[str, object]]) -> list[Actionabl
         dependencies = [part.strip() for part in raw_dependencies.split(";") if part.strip()]
         tasks.append(
             ActionableTask(
+                task_id=str(row.get("task_id", "") or "").strip(),
                 task=str(row.get("task", "") or "").strip(),
                 person_in_charge_role=str(row.get("PIC", "") or "").strip(),
                 deadline=row.get("deadline"),
@@ -1983,9 +2201,86 @@ def dashboard_rows_to_tasks(rows: Iterable[dict[str, object]]) -> list[Actionabl
                 current_status=str(row.get("status", "Not started")),
                 task_dependencies=dependencies,
                 operational_risk_level=str(row.get("risk", "Medium")),
+                task_phase=str(row.get("task_phase", "Pre-event")),
             )
         )
+    tasks = ensure_task_ids(tasks)
+    task_names = [task.task for task in tasks]
+    if len(task_names) != len(set(task_names)):
+        raise TaskValidationError(
+            "Task names must be unique so dependency references remain unambiguous."
+        )
+    if brief is not None:
+        validate_task_deadlines(brief, tasks)
     return tasks
+
+
+def add_task_to_plan(plan: OperationsPlan) -> OperationsPlan:
+    """Append one safe editable task without replacing generated tasks."""
+
+    existing_names = {task.task for task in plan.actionable_tasks}
+    suffix = 1
+    task_name = "New task"
+    while task_name in existing_names:
+        suffix += 1
+        task_name = f"New task {suffix}"
+    new_task = ActionableTask(
+        task_id=_new_task_id(),
+        task=task_name,
+        person_in_charge_role="",
+        deadline=plan.event_brief.current_planning_date,
+        priority="Medium",
+        current_status="Not started",
+        task_dependencies=[],
+        operational_risk_level="Medium",
+        task_phase="Pre-event",
+    )
+    return plan.model_copy(
+        update={"actionable_tasks": [*plan.actionable_tasks, new_task]}
+    )
+
+
+def delete_task_from_plan(
+    plan: OperationsPlan, task_id: str
+) -> TaskDeletionResult:
+    """Delete by internal ID and remove now-invalid dependency references."""
+
+    deleted_task = next(
+        (task for task in plan.actionable_tasks if task.task_id == task_id),
+        None,
+    )
+    if deleted_task is None:
+        raise TaskValidationError("The selected task no longer exists.")
+
+    updated_tasks: list[ActionableTask] = []
+    updated_dependents: list[str] = []
+    for task in plan.actionable_tasks:
+        if task.task_id == task_id:
+            continue
+        dependencies = [
+            dependency
+            for dependency in task.task_dependencies
+            if dependency != deleted_task.task
+        ]
+        if dependencies != task.task_dependencies:
+            updated_dependents.append(task.task)
+            task = task.model_copy(update={"task_dependencies": dependencies})
+        updated_tasks.append(task)
+
+    return TaskDeletionResult(
+        plan=plan.model_copy(
+            update={
+                "actionable_tasks": updated_tasks,
+                "deadline_corrections": [
+                    warning
+                    for warning in plan.deadline_corrections
+                    if deleted_task.task not in warning
+                ],
+            }
+        ),
+        deleted_task_name=deleted_task.task,
+        updated_dependent_tasks=tuple(updated_dependents),
+    )
 
 
 def calculate_metrics(tasks: Iterable[ActionableTask]) -> dict[str, int | float]:

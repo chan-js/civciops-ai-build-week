@@ -20,8 +20,11 @@ from ai_service import (
     EventBrief,
     OperationsPlan,
     ProgressReview,
+    TaskValidationError,
+    add_task_to_plan,
     calculate_metrics,
     dashboard_rows_to_tasks,
+    delete_task_from_plan,
     generate_demo_plan,
     generate_demo_progress_review,
     generate_operations_plan,
@@ -81,6 +84,7 @@ def initialise_state() -> None:
         "organisation_type": "Volunteer organisation",
         "event_name": "",
         "event_objective": "",
+        "current_planning_date": date.today(),
         "event_date": date.today() + timedelta(days=90),
         "venue": "",
         "expected_participants": 50,
@@ -92,6 +96,8 @@ def initialise_state() -> None:
         "progress_review": None,
         "review_source": None,
         "task_signature": None,
+        "pending_delete_task_id": None,
+        "task_mutation_notice": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -107,6 +113,8 @@ def load_sample() -> None:
         "progress_review",
         "review_source",
         "task_signature",
+        "pending_delete_task_id",
+        "task_mutation_notice",
     ):
         st.session_state[key] = None
     st.session_state.pop("task_editor", None)
@@ -202,9 +210,14 @@ def render_event_form() -> None:
             st.text_input("Event name", key="event_name")
             st.text_area("Event objective", key="event_objective", height=115)
             st.date_input(
+                "Current planning date",
+                key="current_planning_date",
+                format="DD/MM/YYYY",
+                help="No pre-event task may be due before this date.",
+            )
+            st.date_input(
                 "Event date",
                 key="event_date",
-                min_value=date.today(),
                 format="DD/MM/YYYY",
             )
             st.text_input("Venue", key="venue")
@@ -249,6 +262,7 @@ def render_event_form() -> None:
             organisation_type=st.session_state.organisation_type,
             event_name=st.session_state.event_name,
             event_objective=st.session_state.event_objective,
+            current_planning_date=st.session_state.current_planning_date,
             event_date=st.session_state.event_date,
             venue=st.session_state.venue,
             expected_participants=st.session_state.expected_participants,
@@ -288,6 +302,8 @@ def render_event_form() -> None:
     st.session_state.progress_review = None
     st.session_state.review_source = None
     st.session_state.task_signature = None
+    st.session_state.pending_delete_task_id = None
+    st.session_state.task_mutation_notice = None
     st.session_state.pop("task_editor", None)
 
 
@@ -322,6 +338,104 @@ def render_metrics(plan: OperationsPlan) -> None:
         column.metric(label, value)
 
 
+def store_dashboard_plan(plan: OperationsPlan, notice: str) -> None:
+    """Persist a task mutation and invalidate review/editor state safely."""
+
+    st.session_state.operations_plan = plan
+    st.session_state.progress_review = None
+    st.session_state.review_source = None
+    st.session_state.task_signature = None
+    st.session_state.task_mutation_notice = notice
+    st.session_state.pop("task_editor", None)
+
+
+def render_task_controls(plan: OperationsPlan) -> None:
+    """Render API-free add and confirmed delete controls for dashboard tasks."""
+
+    notice = st.session_state.task_mutation_notice
+    if notice:
+        st.success(notice)
+        st.session_state.task_mutation_notice = None
+
+    add_column, guidance_column = st.columns([1, 3], gap="large")
+    with add_column:
+        if st.button("Add task", icon="➕", width="stretch"):
+            updated_plan = add_task_to_plan(plan)
+            store_dashboard_plan(
+                updated_plan,
+                "A new task was added locally and is ready to edit.",
+            )
+            st.rerun()
+    with guidance_column:
+        st.caption(
+            "New tasks are local to this session and do not call the OpenAI API."
+        )
+
+    with st.expander("Delete a task"):
+        if not plan.actionable_tasks:
+            st.caption("There are no tasks to delete.")
+        for task in plan.actionable_tasks:
+            name_column, delete_column = st.columns([5, 1])
+            name_column.write(task.task)
+            if delete_column.button(
+                "Delete",
+                key=f"delete_task_{task.task_id}",
+                help=f"Request deletion of {task.task}",
+                width="stretch",
+            ):
+                st.session_state.pending_delete_task_id = task.task_id
+
+    pending_task_id = st.session_state.pending_delete_task_id
+    if not pending_task_id:
+        return
+    pending_task = next(
+        (
+            task
+            for task in plan.actionable_tasks
+            if task.task_id == pending_task_id
+        ),
+        None,
+    )
+    if pending_task is None:
+        st.session_state.pending_delete_task_id = None
+        st.warning("The selected task no longer exists.")
+        return
+
+    dependent_names = [
+        task.task
+        for task in plan.actionable_tasks
+        if pending_task.task in task.task_dependencies
+    ]
+    st.warning(
+        f"Confirm deletion of “{pending_task.task}”. This cannot be undone "
+        "during the current session."
+    )
+    if dependent_names:
+        st.info(
+            "Its dependency reference will be removed safely from: "
+            + "; ".join(dependent_names)
+        )
+    confirm_column, cancel_column = st.columns(2)
+    if confirm_column.button("Confirm deletion", type="primary"):
+        result = delete_task_from_plan(plan, pending_task_id)
+        dependency_note = ""
+        if result.updated_dependent_tasks:
+            dependency_note = (
+                " Removed its dependency reference from "
+                + "; ".join(result.updated_dependent_tasks)
+                + "."
+            )
+        st.session_state.pending_delete_task_id = None
+        store_dashboard_plan(
+            result.plan,
+            f"Deleted “{result.deleted_task_name}”.{dependency_note}",
+        )
+        st.rerun()
+    if cancel_column.button("Cancel deletion"):
+        st.session_state.pending_delete_task_id = None
+        st.rerun()
+
+
 def render_dashboard(plan: OperationsPlan) -> OperationsPlan:
     st.markdown("## 3. Operations dashboard")
     st.markdown(
@@ -329,6 +443,7 @@ def render_dashboard(plan: OperationsPlan) -> OperationsPlan:
         unsafe_allow_html=True,
     )
     metrics_slot = st.container()
+    render_task_controls(plan)
 
     task_frame = pd.DataFrame(tasks_to_dashboard_rows(plan.actionable_tasks))
     edited_frame = st.data_editor(
@@ -370,11 +485,18 @@ def render_dashboard(plan: OperationsPlan) -> OperationsPlan:
         disabled=[],
     )
     try:
-        edited_tasks = dashboard_rows_to_tasks(edited_frame.to_dict(orient="records"))
+        edited_tasks = dashboard_rows_to_tasks(
+            edited_frame.to_dict(orient="records"),
+            brief=plan.event_brief,
+        )
         updated_plan = plan.model_copy(update={"actionable_tasks": edited_tasks})
         st.session_state.operations_plan = updated_plan
-    except ValidationError as exc:
-        st.error("One or more task edits are invalid." + format_validation_error(exc))
+    except (ValidationError, TaskValidationError) as exc:
+        if isinstance(exc, ValidationError):
+            details = format_validation_error(exc)
+        else:
+            details = f" {exc}"
+        st.error("One or more task edits are invalid." + details)
         updated_plan = plan
 
     with metrics_slot:
@@ -672,6 +794,14 @@ def main() -> None:
     st.markdown("## 2. AI operations plan")
     st.caption(f"Plan source: {st.session_state.plan_source}")
     st.write(plan.plan_summary)
+    if plan.deadline_corrections:
+        st.warning(
+            "Deadline safety corrected "
+            f"{len(plan.deadline_corrections)} generated task deadline(s)."
+        )
+        with st.expander("View deadline corrections"):
+            for correction in plan.deadline_corrections:
+                st.markdown(f"- {correction}")
     render_committee(plan)
     plan = render_dashboard(plan)
     render_review(plan)
