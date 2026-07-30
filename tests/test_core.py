@@ -45,23 +45,44 @@ def test_sample_plan_is_valid_and_deterministic() -> None:
     assert len(first.risk_register) >= 5
     assert first.operational_risk_level in {"High", "Critical"}
 
-    risk_distribution = Counter(
-        task.operational_risk_level for task in first.actionable_tasks
-    )
     status_distribution = Counter(task.current_status for task in first.actionable_tasks)
     committee_roles = {
         role.role for role in first.recommended_committee_structure
     }
 
-    assert risk_distribution == {"Low": 5, "Medium": 6, "High": 2, "Critical": 3}
     assert status_distribution == {"Not started": 15, "In progress": 1}
     assert first.actionable_tasks[0].current_status == "In progress"
-    assert {"Chairperson", "Secretary", "Treasurer", "Examination Lead"}.issubset(
+    assert {
+        "Chairperson",
+        "Secretary",
+        "Treasurer",
+        "Exam Team",
+        "Photography Team",
+        "Sound System Team",
+    }.issubset(
         committee_roles
+    )
+    task_risks = {
+        task.task: task.operational_risk_level
+        for task in first.actionable_tasks
+    }
+    assert task_risks["Confirm committee roles and decision rights"] == "Low"
+    assert (
+        task_risks["Approve safeguarding, medical, and emergency response plan"]
+        == "Critical"
+    )
+    assert (
+        task_risks[
+            "Design participant vehicle entry, drop-off, parking, waiting, and exit flow"
+        ]
+        == "High"
     )
 
     professional_brief = brief.model_copy(
-        update={"organisation_type": "Professional non-profit"}
+        update={
+            "organisation_type": "Professional non-profit",
+            "committee_structure": [],
+        }
     )
     professional_plan = generate_demo_plan(professional_brief)
     assert professional_plan.recommended_committee_structure[0].role == "Event Director"
@@ -82,6 +103,8 @@ def test_dashboard_round_trip_preserves_tasks() -> None:
         "risk",
         "dependency",
         "task_phase",
+        "ownership_review_required",
+        "ownership_review_reason",
     ]
     assert rebuilt == plan.actionable_tasks
 

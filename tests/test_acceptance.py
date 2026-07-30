@@ -51,6 +51,7 @@ def test_zero_budget_and_single_person_committee_remain_usable() -> None:
     data = valid_brief_data()
     data["available_budget"] = 0
     data["committee_size"] = 1
+    data["committee_structure"] = []
     brief = EventBrief.model_validate(data)
     plan = generate_demo_plan(brief)
 

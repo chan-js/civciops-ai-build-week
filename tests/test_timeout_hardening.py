@@ -163,12 +163,12 @@ def test_plan_request_and_output_are_bounded(
     request_input = captured["input"]
 
     assert len(plan.actionable_tasks) == 16
-    assert len(plan.recommended_committee_structure) <= 10
+    assert len(plan.recommended_committee_structure) <= 50
     assert len(plan.risk_register) <= 6
     assert len(plan.recommended_next_actions) <= 5
     assert schema["actionable_tasks"]["minItems"] == 12
     assert schema["actionable_tasks"]["maxItems"] == 16
-    assert schema["recommended_committee_structure"]["maxItems"] == 10
+    assert schema["recommended_committee_structure"]["maxItems"] == 50
     assert schema["risk_register"]["maxItems"] == 6
     assert schema["recommended_next_actions"]["maxItems"] == 5
     assert captured["reasoning"] == {"effort": PLAN_REASONING_EFFORT}
@@ -180,6 +180,9 @@ def test_plan_request_and_output_are_bounded(
     assert "no full transitive dependency lists" in prompt
     assert "current_planning_date is authoritative" in prompt
     assert "Never combine event delivery with post-event reporting" in prompt
+    assert "preserve every role or team as a separate" in prompt
+    assert "Do not infer equipment ownership from the word \"transport\" alone" in prompt
+    assert "Critical is only for severe safety" in prompt
     assert captured["text_format"] is GeneratedOperationsPlan
     assert isinstance(request_input, list)
     assert len(request_input) == 2

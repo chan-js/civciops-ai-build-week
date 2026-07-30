@@ -23,6 +23,8 @@ from ai_service import (
     TaskValidationError,
     add_task_to_plan,
     calculate_metrics,
+    committee_headcount_warning,
+    committee_rows_to_roles,
     dashboard_rows_to_tasks,
     delete_task_from_plan,
     generate_demo_plan,
@@ -90,6 +92,7 @@ def initialise_state() -> None:
         "expected_participants": 50,
         "available_budget": 2_000.0,
         "committee_size": 10,
+        "committee_structure": [],
         "constraints_and_special_requirements": "",
         "operations_plan": None,
         "plan_source": None,
@@ -106,7 +109,11 @@ def initialise_state() -> None:
 
 def load_sample() -> None:
     for key, value in SAMPLE_EVENT.items():
-        st.session_state[key] = value
+        st.session_state[key] = (
+            [dict(row) for row in value]
+            if key == "committee_structure"
+            else value
+        )
     for key in (
         "operations_plan",
         "plan_source",
@@ -118,6 +125,7 @@ def load_sample() -> None:
     ):
         st.session_state[key] = None
     st.session_state.pop("task_editor", None)
+    st.session_state.pop("committee_editor", None)
 
 
 def format_validation_error(exc: ValidationError) -> str:
@@ -203,7 +211,7 @@ def render_event_form() -> None:
         load_sample()
         st.rerun()
 
-    with st.form("event_brief_form", border=True):
+    with st.container(border=True):
         col1, col2 = st.columns(2, gap="large")
         with col1:
             st.text_input("Organisation type", key="organisation_type")
@@ -250,11 +258,79 @@ def render_event_form() -> None:
                 height=175,
                 help="Include programme components, accessibility, safety, food, transport, venue, or policy constraints.",
             )
-        submitted = st.form_submit_button(
+
+        st.markdown("#### Committee roles and teams")
+        st.caption(
+            "Add, edit, or remove independent roles. Keep distinct teams on "
+            "separate rows so ownership can follow their actual responsibilities."
+        )
+        committee_columns = [
+            "role",
+            "lead",
+            "headcount",
+            "responsibilities",
+        ]
+        committee_frame = pd.DataFrame(
+            st.session_state.committee_structure,
+            columns=committee_columns,
+        )
+        edited_committee_frame = st.data_editor(
+            committee_frame,
+            key="committee_editor",
+            hide_index=True,
+            width="stretch",
+            height=390,
+            num_rows="dynamic",
+            column_order=committee_columns,
+            column_config={
+                "role": st.column_config.TextColumn(
+                    "Role or team", required=True, width="medium"
+                ),
+                "lead": st.column_config.TextColumn(
+                    "Lead / PIC", width="medium"
+                ),
+                "headcount": st.column_config.NumberColumn(
+                    "Headcount",
+                    min_value=1,
+                    max_value=1_000,
+                    step=1,
+                    required=True,
+                    width="small",
+                ),
+                "responsibilities": st.column_config.TextColumn(
+                    "Responsibilities", required=True, width="large"
+                ),
+            },
+        )
+        committee_rows = edited_committee_frame.to_dict(orient="records")
+        st.session_state.committee_structure = committee_rows
+        committee_roles = None
+        committee_error: ValidationError | TaskValidationError | None = None
+        try:
+            committee_roles = committee_rows_to_roles(committee_rows)
+        except (ValidationError, TaskValidationError) as exc:
+            committee_error = exc
+        if committee_roles is not None:
+            mismatch_warning = committee_headcount_warning(
+                st.session_state.committee_size,
+                committee_roles,
+            )
+            if mismatch_warning:
+                st.warning(mismatch_warning)
+
+        submitted = st.button(
             "Generate operations plan", type="primary", width="stretch"
         )
 
     if not submitted:
+        return
+
+    if committee_error is not None:
+        if isinstance(committee_error, ValidationError):
+            details = format_validation_error(committee_error)
+        else:
+            details = f" {committee_error}"
+        st.error("Committee roles are invalid." + details, icon="⚠️")
         return
 
     try:
@@ -268,6 +344,7 @@ def render_event_form() -> None:
             expected_participants=st.session_state.expected_participants,
             available_budget=st.session_state.available_budget,
             committee_size=st.session_state.committee_size,
+            committee_structure=committee_roles or [],
             constraints_and_special_requirements=st.session_state.constraints_and_special_requirements,
         )
     except ValidationError as exc:
@@ -308,11 +385,17 @@ def render_event_form() -> None:
 
 
 def render_committee(plan: OperationsPlan) -> None:
+    supplied_roles = {
+        item.role: item for item in plan.event_brief.committee_structure
+    }
     with st.expander("Recommended committee structure", expanded=True):
         columns = st.columns(3)
         for index, role in enumerate(plan.recommended_committee_structure):
             with columns[index % 3]:
                 st.markdown(f"**{role.role}** · {role.suggested_people} person(s)")
+                supplied = supplied_roles.get(role.role)
+                if supplied and supplied.lead:
+                    st.caption(f"Lead / PIC: {supplied.lead}")
                 st.caption(role.purpose)
 
 
@@ -801,6 +884,38 @@ def main() -> None:
         )
         with st.expander("View deadline corrections"):
             for correction in plan.deadline_corrections:
+                st.markdown(f"- {correction}")
+    if plan.committee_corrections:
+        st.warning(
+            "Committee fidelity corrected the generated committee structure."
+        )
+        with st.expander("View committee corrections"):
+            for correction in plan.committee_corrections:
+                st.markdown(f"- {correction}")
+    review_required_tasks = [
+        task
+        for task in plan.actionable_tasks
+        if task.ownership_review_required
+    ]
+    if plan.ownership_corrections or review_required_tasks:
+        st.warning(
+            "Responsibility validation corrected generated task owners; "
+            f"{len(review_required_tasks)} task(s) require human ownership review."
+        )
+        with st.expander("View ownership corrections"):
+            for correction in plan.ownership_corrections:
+                st.markdown(f"- {correction}")
+            for task in review_required_tasks:
+                st.markdown(
+                    f"- **{task.task}** — {task.ownership_review_reason}"
+                )
+    if plan.risk_corrections:
+        st.warning(
+            "Risk calibration corrected "
+            f"{len(plan.risk_corrections)} generated task rating(s)."
+        )
+        with st.expander("View risk corrections"):
+            for correction in plan.risk_corrections:
                 st.markdown(f"- {correction}")
     render_committee(plan)
     plan = render_dashboard(plan)
