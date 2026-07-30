@@ -62,6 +62,7 @@ Status = Literal["Not started", "In progress", "Completed", "Blocked"]
 Priority = Literal["Low", "Medium", "High", "Critical"]
 RiskLevel = Literal["Low", "Medium", "High", "Critical"]
 TaskPhase = Literal["Pre-event", "Event-day delivery", "Post-event closeout"]
+REVIEW_REQUIRED_OWNER = "Main Committee — review required"
 OpenAIOperation = Literal["plan_generation", "progress_review"]
 OpenAIErrorCategory = Literal[
     "authentication",
@@ -258,6 +259,20 @@ class BoundedReviewModel(StrictModel):
         return value
 
 
+class StructuredCommitteeRole(StrictModel):
+    """A user-supplied committee role or independent operating team."""
+
+    role: str = Field(min_length=1, max_length=120)
+    lead: str = Field(default="", max_length=120)
+    headcount: int = Field(ge=1, le=1_000)
+    responsibilities: str = Field(min_length=3, max_length=1_000)
+
+    @field_validator("role", "lead", "responsibilities", mode="before")
+    @classmethod
+    def strip_committee_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+
 class EventBrief(StrictModel):
     """Validated event details supplied by the user."""
 
@@ -270,6 +285,9 @@ class EventBrief(StrictModel):
     expected_participants: int = Field(ge=1, le=100_000)
     available_budget: float = Field(ge=0, le=1_000_000_000)
     committee_size: int = Field(ge=1, le=1_000)
+    committee_structure: list[StructuredCommitteeRole] = Field(
+        default_factory=list, max_length=50
+    )
     constraints_and_special_requirements: str = Field(
         min_length=3, max_length=3_000
     )
@@ -293,13 +311,16 @@ class EventBrief(StrictModel):
                 "Event date must be today or a future date relative to the current "
                 "planning date."
             )
+        role_names = [item.role.casefold() for item in self.committee_structure]
+        if len(role_names) != len(set(role_names)):
+            raise ValueError("Committee role or team names must be unique.")
         return self
 
 
 class CommitteeRole(StrictModel):
-    role: str = Field(min_length=2, max_length=120)
-    purpose: str = Field(min_length=5, max_length=300)
-    suggested_people: int = Field(ge=1, le=100)
+    role: str = Field(min_length=1, max_length=120)
+    purpose: str = Field(min_length=3, max_length=1_000)
+    suggested_people: int = Field(ge=1, le=1_000)
 
 
 class ActionableTask(StrictModel):
@@ -312,6 +333,8 @@ class ActionableTask(StrictModel):
     task_dependencies: list[str] = Field(max_length=5)
     operational_risk_level: RiskLevel
     task_phase: TaskPhase = "Pre-event"
+    ownership_review_required: bool = False
+    ownership_review_reason: str = Field(default="", max_length=300)
 
     @field_validator("task_id", "task", "person_in_charge_role", mode="before")
     @classmethod
@@ -340,7 +363,7 @@ class OperationsPlan(StrictModel):
     event_brief: EventBrief
     plan_summary: str = Field(min_length=20, max_length=800)
     recommended_committee_structure: list[CommitteeRole] = Field(
-        min_length=1, max_length=10
+        min_length=1, max_length=50
     )
     actionable_tasks: list[ActionableTask]
     operational_risk_level: RiskLevel
@@ -349,6 +372,9 @@ class OperationsPlan(StrictModel):
         min_length=1, max_length=5
     )
     deadline_corrections: list[str] = Field(default_factory=list, max_length=100)
+    committee_corrections: list[str] = Field(default_factory=list, max_length=100)
+    ownership_corrections: list[str] = Field(default_factory=list, max_length=100)
+    risk_corrections: list[str] = Field(default_factory=list, max_length=100)
 
 
 class GeneratedOperationsPlan(OperationsPlan):
@@ -531,15 +557,160 @@ class TaskDeletionResult:
     updated_dependent_tasks: tuple[str, ...]
 
 
+RISK_CLASSIFICATION_RUBRIC: dict[RiskLevel, str] = {
+    "Critical": (
+        "Failure could cause severe safety, safeguarding, legal, event-cancellation, "
+        "or irreversible operational consequences."
+    ),
+    "High": "Failure could cause major operational disruption or loss of a key capability.",
+    "Medium": "Failure would cause manageable disruption requiring active attention.",
+    "Low": "Failure would have limited, recoverable operational impact.",
+}
+
+RESPONSIBILITY_DOMAIN_MARKERS: dict[str, tuple[str, ...]] = {
+    "governance": (
+        "chairperson",
+        "event director",
+        "decision rights",
+        "protocol",
+        "committee coordination",
+        "key approvals",
+        "required approvals",
+        "school liaison",
+    ),
+    "documentation": (
+        "secretary",
+        "official documents",
+        "minutes",
+        "registration",
+        "consent",
+        "roster",
+        "emcee script",
+        "briefing pack",
+    ),
+    "finance": (
+        "treasurer",
+        "finance",
+        "budget",
+        "income and expenditure",
+        "financial report",
+        "petty cash",
+        "procurement",
+        "reconciliation",
+    ),
+    "exam": (
+        "exam team",
+        "exam",
+        "examination",
+        "competition rules",
+        "test materials",
+        "judges",
+        "scoring",
+        "results",
+        "foot drill",
+    ),
+    "food": (
+        "food team",
+        "food",
+        "meal",
+        "dietary",
+        "food safety",
+        "catering",
+    ),
+    "venue": (
+        "venue and marshalling",
+        "venue",
+        "venue layout",
+        "participant walking flow",
+        "marshalling",
+        "crowd control",
+        "wet-weather",
+        "wet weather",
+        "signage",
+    ),
+    "participant_traffic": (
+        "participant vehicle",
+        "vehicle entry",
+        "drop-off",
+        "drop off",
+        "parking",
+        "vehicle waiting",
+        "exit flow",
+        "exit route",
+        "traffic marshal",
+        "traffic flow",
+    ),
+    "equipment": (
+        "equipment team",
+        "equipment and transport",
+        "equipment",
+        "equipment checklist",
+        "equipment preparation",
+        "equipment sourcing",
+        "borrowing",
+        "purchasing",
+        "equipment testing",
+        "equipment setup",
+        "equipment return",
+    ),
+    "gifts": (
+        "gift and prize",
+        "gifts",
+        "prize",
+        "gift",
+        "trophy",
+        "certificate",
+    ),
+    "photography": (
+        "photography team",
+        "photography",
+        "photograph",
+        "photo coverage",
+    ),
+    "sound": (
+        "sound system team",
+        "sound system",
+        "audio",
+        "microphone",
+        "public address",
+    ),
+    "safety": (
+        "safeguarding",
+        "medical",
+        "emergency response",
+        "first-aid readiness",
+        "first aid readiness",
+        "incident response",
+        "safety inspection",
+    ),
+}
+
+
 PLAN_INSTRUCTIONS = """Create a concise, practical event operations plan in British
 English for the supplied volunteer, student-society, or non-profit event brief.
 Preserve the supplied facts and fit role names and headcount to the organisation type.
 
-Return 12–16 specific operational tasks, no more than 10 committee roles, no more than
-6 material risks, and no more than 5 immediate next actions. Assign one responsible
-role and an ISO deadline to every task. Give every task a unique opaque task_id. List
-only direct prerequisites, with no full transitive dependency lists. Keep summaries,
-role purposes, risks, mitigations, and actions concise.
+Return 12–16 specific operational tasks, no more than 50 committee roles, no more than
+6 material risks, and no more than 5 immediate next actions. When committee_structure
+is supplied, preserve every role or team as a separate recommended committee entry,
+using its role name exactly. Never combine Photography Team with Sound System Team or
+merge any other independently supplied teams. Do not invent, rename, omit, or merge
+supplied roles. Preserve their headcounts and responsibilities.
+
+Assign one responsible role and an ISO deadline to every task. When structured
+committee roles are supplied, task owners must be exactly one supplied role name or
+one supplied named lead. Use the supplied responsibilities as the source of truth.
+Participant vehicle entry, drop-off, parking, waiting, pedestrian separation, exit
+routes, traffic marshals, and signs are participant-traffic work; equipment checklists,
+sourcing, borrowing or purchasing, testing, setup, and return are equipment-logistics
+work. Do not infer equipment ownership from the word "transport" alone. If no supplied
+role clearly owns a task, use "Main Committee — review required", set
+ownership_review_required true, and explain why in ownership_review_reason. Never
+silently guess or invent a team.
+
+Give every task a unique opaque task_id. List only direct prerequisites, with no full
+transitive dependency lists. Keep summaries, role purposes, risks, mitigations, and
+actions concise.
 
 The supplied current_planning_date is authoritative. No Pre-event task deadline may be
 earlier than current_planning_date or later than event_date. Keep task deadlines in
@@ -551,6 +722,14 @@ expenditure statement, results reconciliation, equipment return, and post-event
 documentation. Never combine event delivery with post-event reporting or closeout in a
 single task. Set every other task_phase to "Pre-event". Set deadline_corrections to an
 empty list because the application performs its own deterministic safety check.
+
+Calibrate each task risk by consequence: Critical is only for severe safety,
+safeguarding, legal, event-cancellation, or irreversible consequences; High is for
+major operational disruption; Medium is for manageable disruption requiring active
+attention; Low is for limited and recoverable impact. Do not target a fixed category
+distribution and do not downgrade genuine safety or safeguarding risks. Set
+committee_corrections, ownership_corrections, and risk_corrections to empty lists
+because the application validates these deterministically.
 
 For a newly generated plan, mark the first governance task In progress and every other
 task Not started. Do not claim that approvals, bookings, suppliers, payments, or
@@ -732,6 +911,564 @@ def ensure_task_ids(
     return prepared
 
 
+def committee_roles_to_rows(
+    roles: Iterable[StructuredCommitteeRole],
+) -> list[dict[str, object]]:
+    """Map structured committee roles to the editable Event Brief table."""
+
+    return [
+        {
+            "role": item.role,
+            "lead": item.lead,
+            "headcount": item.headcount,
+            "responsibilities": item.responsibilities,
+        }
+        for item in roles
+    ]
+
+
+def committee_rows_to_roles(
+    rows: Iterable[dict[str, object]],
+) -> list[StructuredCommitteeRole]:
+    """Validate user-edited committee rows while ignoring wholly empty draft rows."""
+
+    roles: list[StructuredCommitteeRole] = []
+    for row in rows:
+        role = str(row.get("role", "") or "").strip()
+        lead = str(row.get("lead", "") or "").strip()
+        responsibilities = str(row.get("responsibilities", "") or "").strip()
+        raw_headcount = row.get("headcount")
+        headcount_is_blank = raw_headcount is None or (
+            isinstance(raw_headcount, float) and math.isnan(raw_headcount)
+        )
+        if not role and not lead and not responsibilities and headcount_is_blank:
+            continue
+        roles.append(
+            StructuredCommitteeRole(
+                role=role,
+                lead=lead,
+                headcount=raw_headcount,
+                responsibilities=responsibilities,
+            )
+        )
+    role_names = [item.role.casefold() for item in roles]
+    if len(role_names) != len(set(role_names)):
+        raise TaskValidationError("Committee role or team names must be unique.")
+    return roles
+
+
+def committee_headcount_warning(
+    committee_size: int,
+    roles: Iterable[StructuredCommitteeRole],
+) -> str | None:
+    """Return a non-blocking warning when structured headcounts do not reconcile."""
+
+    structured_total = sum(item.headcount for item in roles)
+    if structured_total == committee_size:
+        return None
+    return (
+        f"Committee role headcounts total {structured_total}, while the overall "
+        f"committee size is {committee_size}. Review the allocation before generating "
+        "the plan. You can still generate the plan."
+    )
+
+
+def _expected_committee_structure(brief: EventBrief) -> list[CommitteeRole]:
+    return [
+        CommitteeRole(
+            role=item.role,
+            purpose=item.responsibilities,
+            suggested_people=item.headcount,
+        )
+        for item in brief.committee_structure
+    ]
+
+
+def _preserve_supplied_committee(
+    committee: list[CommitteeRole],
+    brief: EventBrief,
+) -> tuple[list[CommitteeRole], list[str]]:
+    """Replace merged, invented, omitted, or altered roles with supplied roles."""
+
+    expected = _expected_committee_structure(brief)
+    if not expected:
+        return committee, []
+    if committee == expected:
+        return committee, []
+
+    expected_names = [item.role for item in expected]
+    actual_names = [item.role for item in committee]
+    missing = [name for name in expected_names if name not in actual_names]
+    invented = [name for name in actual_names if name not in expected_names]
+    details: list[str] = []
+    if missing:
+        details.append("restored missing or merged role(s): " + "; ".join(missing))
+    if invented:
+        details.append("removed invented role(s): " + "; ".join(invented))
+    if not details:
+        details.append("restored supplied headcounts, order, and responsibilities")
+    return expected, [
+        "Committee fidelity correction: " + "; ".join(details) + "."
+    ]
+
+
+def _text_domains(value: str) -> set[str]:
+    normalised = " ".join(re.sub(r"[^a-z0-9]+", " ", value.casefold()).split())
+    domains: set[str] = set()
+    for domain, markers in RESPONSIBILITY_DOMAIN_MARKERS.items():
+        for marker in markers:
+            normalised_marker = " ".join(
+                re.sub(r"[^a-z0-9]+", " ", marker.casefold()).split()
+            )
+            if normalised_marker and normalised_marker in normalised:
+                domains.add(domain)
+                break
+    return domains
+
+
+def task_responsibility_domains(task: ActionableTask) -> set[str]:
+    """Classify task concepts without treating bare 'transport' as equipment."""
+
+    domains = _text_domains(task.task)
+    if task.task_phase == "Event-day delivery":
+        domains.add("governance")
+    elif task.task_phase == "Post-event closeout":
+        domains.add("finance")
+    return domains
+
+
+def _role_domain_strength(
+    role: StructuredCommitteeRole, domain: str
+) -> int:
+    role_name = role.role.casefold()
+    if domain == "governance":
+        if role_name == "chairperson":
+            return 8
+        if role_name == "vice chairperson":
+            return 3
+
+    name_domains = _text_domains(role.role)
+    responsibility_domains = _text_domains(role.responsibilities)
+    strength = 0
+    if domain in name_domains:
+        strength += 5
+    if domain in responsibility_domains:
+        strength += 2
+    return strength
+
+
+def _responsibility_tokens(value: str) -> set[str]:
+    # These generic operational words are useful only as part of domain phrases
+    # (for example, "food safety" or "crowd control"), never as standalone
+    # evidence that one supplied role owns a task.
+    stop_words = {
+        "and",
+        "the",
+        "for",
+        "with",
+        "from",
+        "into",
+        "plus",
+        "team",
+        "role",
+        "event",
+        "task",
+        "workstream",
+        "manage",
+        "plan",
+        "prepare",
+        "coordinate",
+        "confirm",
+        "handle",
+        "support",
+        "overall",
+        "safe",
+        "safety",
+        "inspection",
+        "inspections",
+        "control",
+        "controls",
+        "controlled",
+        "controlling",
+        "plans",
+        "planning",
+        "operation",
+        "operations",
+        "operational",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", value.casefold())
+        if len(token) >= 4 and token not in stop_words
+    }
+
+
+def _lexical_responsibility_owner(
+    task: ActionableTask,
+    brief: EventBrief,
+) -> str | None:
+    task_tokens = _responsibility_tokens(task.task)
+    if not task_tokens:
+        return None
+    scores: list[tuple[int, StructuredCommitteeRole]] = []
+    for role in brief.committee_structure:
+        role_tokens = _responsibility_tokens(
+            f"{role.role} {role.responsibilities}"
+        )
+        score = len(task_tokens & role_tokens)
+        if score:
+            scores.append((score, role))
+    if not scores:
+        return None
+    highest_score = max(score for score, _ in scores)
+    strongest = [role for score, role in scores if score == highest_score]
+    return strongest[0].role if len(strongest) == 1 else None
+
+
+def responsibility_owner_for_task(
+    task: ActionableTask,
+    brief: EventBrief,
+) -> tuple[str, str]:
+    """Choose a supplied role only when its responsibilities clearly cover the task."""
+
+    domains = task_responsibility_domains(task)
+    if not domains:
+        lexical_owner = _lexical_responsibility_owner(task, brief)
+        if lexical_owner:
+            return lexical_owner, ""
+        return (
+            REVIEW_REQUIRED_OWNER,
+            "No supplied responsibility clearly matches this task.",
+        )
+
+    candidates: list[tuple[int, StructuredCommitteeRole]] = []
+    for role in brief.committee_structure:
+        strengths = [_role_domain_strength(role, domain) for domain in domains]
+        if all(strength > 0 for strength in strengths):
+            candidates.append((sum(strengths), role))
+    if not candidates:
+        lexical_owner = _lexical_responsibility_owner(task, brief)
+        if lexical_owner:
+            return lexical_owner, ""
+        return (
+            REVIEW_REQUIRED_OWNER,
+            "No supplied role covers all responsibility areas identified for this task.",
+        )
+
+    highest_score = max(score for score, _ in candidates)
+    strongest = [role for score, role in candidates if score == highest_score]
+    if len(strongest) != 1:
+        return (
+            REVIEW_REQUIRED_OWNER,
+            "Multiple supplied roles are equally plausible owners.",
+        )
+    return strongest[0].role, ""
+
+
+def _correct_generated_owners(
+    tasks: Iterable[ActionableTask],
+    brief: EventBrief,
+) -> tuple[list[ActionableTask], list[str]]:
+    if not brief.committee_structure:
+        return list(tasks), []
+
+    supplied_owner_to_role: dict[str, str] = {}
+    for role in brief.committee_structure:
+        supplied_owner_to_role[role.role.casefold()] = role.role
+        if role.lead:
+            supplied_owner_to_role[role.lead.casefold()] = role.role
+
+    corrected_tasks: list[ActionableTask] = []
+    corrections: list[str] = []
+    for task in tasks:
+        expected_owner, review_reason = responsibility_owner_for_task(task, brief)
+        current_role = supplied_owner_to_role.get(
+            task.person_in_charge_role.casefold()
+        )
+        current_owner_is_valid = (
+            expected_owner != REVIEW_REQUIRED_OWNER
+            and current_role == expected_owner
+        )
+        if current_owner_is_valid:
+            corrected_tasks.append(
+                task.model_copy(
+                    update={
+                        "ownership_review_required": False,
+                        "ownership_review_reason": "",
+                    }
+                )
+            )
+            continue
+
+        if expected_owner == REVIEW_REQUIRED_OWNER:
+            corrected_owner = REVIEW_REQUIRED_OWNER
+            review_required = True
+        else:
+            corrected_owner = expected_owner
+            review_required = False
+            review_reason = ""
+        if (
+            task.person_in_charge_role != corrected_owner
+            or task.ownership_review_required != review_required
+            or task.ownership_review_reason != review_reason
+        ):
+            corrections.append(
+                f"“{task.task}” owner changed from "
+                f"“{task.person_in_charge_role or 'Unassigned'}” to "
+                f"“{corrected_owner}”."
+            )
+        corrected_tasks.append(
+            task.model_copy(
+                update={
+                    "person_in_charge_role": corrected_owner,
+                    "ownership_review_required": review_required,
+                    "ownership_review_reason": review_reason,
+                }
+            )
+        )
+    return corrected_tasks, corrections
+
+
+def classify_task_risk(task: ActionableTask) -> RiskLevel:
+    """Classify task risk from explicit consequences and available recovery."""
+
+    value = task.task.casefold()
+    if task.task_phase == "Event-day delivery":
+        return "Critical"
+    if task.task_phase == "Post-event closeout":
+        return "Medium"
+
+    severe_consequence_markers = (
+        "severe allergy",
+        "anaphylaxis",
+        "food poisoning",
+        "regulatory breach",
+        "legal breach",
+        "statutory breach",
+        "event cancellation",
+        "cancel the event",
+        "cancellation risk",
+        "no safe alternative",
+        "irreversible harm",
+        "irreversible financial",
+        "irreversible operational",
+        "fatality",
+        "life-threatening",
+        "severe injury",
+        "severe harm",
+    )
+    if any(marker in value for marker in severe_consequence_markers):
+        return "Critical"
+
+    if any(
+        marker in value
+        for marker in ("safeguarding", "medical emergency", "emergency response")
+    ):
+        return "Critical"
+
+    approval_is_event_gate = (
+        any(
+            marker in value
+            for marker in (
+                "required approval",
+                "required approvals",
+                "mandatory approval",
+                "legal approval",
+                "regulatory approval",
+                "permit",
+                "licence",
+                "license",
+            )
+        )
+        and any(
+            marker in value
+            for marker in ("venue", "school", "legal", "regulatory", "event")
+        )
+    )
+    if approval_is_event_gate:
+        return "Critical"
+
+    assessment_materials = any(
+        marker in value
+        for marker in (
+            "written test",
+            "written assessment",
+            "test materials",
+            "assessment materials",
+        )
+    )
+    if assessment_materials:
+        integrity_cannot_recover = any(
+            marker in value
+            for marker in (
+                "competition integrity",
+                "test leak",
+                "leaked test",
+                "cannot be replaced",
+                "no recovery",
+                "irreparable",
+            )
+        )
+        return "High" if integrity_cannot_recover else "Medium"
+
+    equipment_work = any(
+        marker in value
+        for marker in (
+            "equipment",
+            "microphone",
+            "public-address",
+            "public address",
+            "sound system",
+        )
+    )
+    if equipment_work:
+        essential = any(
+            marker in value
+            for marker in ("essential", "safety-critical", "life-safety")
+        )
+        no_fallback = any(
+            marker in value
+            for marker in (
+                "no practical fallback",
+                "no fallback",
+                "no substitute",
+                "cannot be replaced",
+                "single point of failure",
+            )
+        )
+        return "High" if essential and no_fallback else "Medium"
+
+    food_work = any(
+        marker in value
+        for marker in (
+            "food",
+            "meal",
+            "dietary",
+            "allergen",
+            "allergy",
+            "catering",
+        )
+    )
+    if food_work:
+        active_food_safety = any(
+            marker in value
+            for marker in (
+                "food safety",
+                "food hygiene",
+                "meal safety",
+                "dietary need",
+                "dietary requirement",
+                "allergen",
+                "allergy",
+            )
+        )
+        return "High" if active_food_safety else "Medium"
+
+    traffic_or_crowd_work = any(
+        marker in value
+        for marker in (
+            "participant vehicle",
+            "vehicle entry",
+            "drop-off",
+            "drop off",
+            "parking",
+            "traffic flow",
+            "pedestrian separation",
+            "participant walking flow",
+            "crowd control",
+            "crowd movement",
+            "venue layout",
+            "wet-weather",
+            "wet weather",
+        )
+    )
+    if traffic_or_crowd_work:
+        return "High"
+
+    serious_but_recoverable_safety = any(
+        marker in value
+        for marker in (
+            "safety inspection",
+            "safety rehearsal",
+            "first-aid readiness",
+            "first aid readiness",
+            "incident response drill",
+        )
+    )
+    if serious_but_recoverable_safety:
+        return "High"
+
+    fairness_or_reputation = any(
+        marker in value
+        for marker in (
+            "competition rules",
+            "scoring",
+            "dispute",
+            "judges",
+            "competition integrity",
+            "substantial reputation",
+            "substantial fairness",
+        )
+    )
+    if fairness_or_reputation:
+        return "High"
+
+    major_recoverable_impact = any(
+        marker in value
+        for marker in (
+            "major disruption",
+            "essential capability",
+            "serious but recoverable",
+            "substantial financial loss",
+        )
+    )
+    if major_recoverable_impact:
+        return "High"
+
+    low_markers = (
+        "confirm committee roles",
+        "routine",
+        "archive",
+        "lessons review",
+    )
+    if any(marker in value for marker in low_markers):
+        return "Low"
+
+    manageable_work_markers = (
+        "checklist",
+        "sourcing",
+        "return",
+        "secure handling",
+        "securely control",
+        "roster",
+        "briefing pack",
+        "reconciliation",
+    )
+    if any(marker in value for marker in manageable_work_markers):
+        return "Medium"
+
+    return "Medium"
+
+
+def _correct_generated_risks(
+    tasks: Iterable[ActionableTask],
+) -> tuple[list[ActionableTask], list[str]]:
+    corrected_tasks: list[ActionableTask] = []
+    corrections: list[str] = []
+    for task in tasks:
+        expected_risk = classify_task_risk(task)
+        if task.operational_risk_level != expected_risk:
+            corrections.append(
+                f"“{task.task}” risk changed from {task.operational_risk_level} "
+                f"to {expected_risk}: {RISK_CLASSIFICATION_RUBRIC[expected_risk]}"
+            )
+            task = task.model_copy(
+                update={"operational_risk_level": expected_risk}
+            )
+        corrected_tasks.append(task)
+    return corrected_tasks, corrections
+
+
 def validate_task_deadlines(
     brief: EventBrief, tasks: Iterable[ActionableTask]
 ) -> None:
@@ -771,14 +1508,14 @@ def apply_generated_plan_safety(
     *,
     deterministic_ids: bool = False,
 ) -> OperationsPlan:
-    """Apply the smallest deterministic deadline corrections to generated work."""
+    """Apply deterministic deadline, committee, ownership, and risk corrections."""
 
     tasks = ensure_task_ids(
         plan.actionable_tasks,
         brief=brief,
         deterministic=deterministic_ids,
     )
-    corrections: list[str] = []
+    deadline_corrections: list[str] = []
     corrected_tasks: list[ActionableTask] = []
     previous_pre_event_deadline = brief.current_planning_date
 
@@ -801,20 +1538,33 @@ def apply_generated_plan_safety(
             )
 
         if corrected_deadline != original_deadline:
-            corrections.append(
+            deadline_corrections.append(
                 f"“{task.task}” moved from {original_deadline.isoformat()} to "
                 f"{corrected_deadline.isoformat()}."
             )
             task = task.model_copy(update={"deadline": corrected_deadline})
         corrected_tasks.append(task)
 
+    preserved_committee, committee_corrections = _preserve_supplied_committee(
+        plan.recommended_committee_structure,
+        brief,
+    )
+    corrected_tasks, ownership_corrections = _correct_generated_owners(
+        corrected_tasks,
+        brief,
+    )
+    corrected_tasks, risk_corrections = _correct_generated_risks(corrected_tasks)
     validate_task_deadlines(brief, corrected_tasks)
     return OperationsPlan.model_validate(
         {
             **plan.model_dump(mode="python"),
             "event_brief": brief,
+            "recommended_committee_structure": preserved_committee,
             "actionable_tasks": corrected_tasks,
-            "deadline_corrections": corrections,
+            "deadline_corrections": deadline_corrections,
+            "committee_corrections": committee_corrections,
+            "ownership_corrections": ownership_corrections,
+            "risk_corrections": risk_corrections,
         }
     )
 
@@ -1179,7 +1929,10 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             operational_risk_level="Medium",
         ),
         ActionableTask(
-            task="Design arrival, parking, drop-off, and transport flow",
+            task=(
+                "Design participant vehicle entry, drop-off, parking, waiting, "
+                "and exit flow"
+            ),
             person_in_charge_role=logistics_lead,
             deadline=_deadline(event_date, 42),
             priority="High",
@@ -1197,13 +1950,19 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             operational_risk_level="Medium",
         ),
         ActionableTask(
-            task="Lock venue layout, equipment list, signage, and wet-weather option",
+            task=(
+                "Lock venue layout, participant walking flow, crowd control, "
+                "signage, and wet-weather option"
+            ),
             person_in_charge_role=venue_lead,
             deadline=_deadline(event_date, 28),
             priority="High",
             current_status="Not started",
             task_dependencies=[
-                "Design arrival, parking, drop-off, and transport flow",
+                (
+                    "Design participant vehicle entry, drop-off, parking, waiting, "
+                    "and exit flow"
+                ),
                 "Finalise competition rules, scoring, and dispute process",
             ],
             operational_risk_level="Medium",
@@ -1224,7 +1983,10 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             priority="Critical",
             current_status="Not started",
             task_dependencies=[
-                "Lock venue layout, equipment list, signage, and wet-weather option",
+                (
+                    "Lock venue layout, participant walking flow, crowd control, "
+                    "signage, and wet-weather option"
+                ),
                 "Approve safeguarding, medical, and emergency response plan",
             ],
             operational_risk_level="Critical",
@@ -1236,19 +1998,28 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             priority="High",
             current_status="Not started",
             task_dependencies=[
-                "Lock venue layout, equipment list, signage, and wet-weather option"
+                (
+                    "Lock venue layout, participant walking flow, crowd control, "
+                    "signage, and wet-weather option"
+                )
             ],
             operational_risk_level="Low",
         ),
         ActionableTask(
-            task="Confirm suppliers, deliveries, petty cash, and final budget position",
-            person_in_charge_role=finance_lead,
+            task=(
+                "Confirm equipment checklist, sourcing, testing, setup, "
+                "and return plan"
+            ),
+            person_in_charge_role=logistics_lead,
             deadline=_deadline(event_date, 7),
             priority="Critical",
             current_status="Not started",
             task_dependencies=[
                 "Approve itemised budget and procurement limits",
-                "Confirm meal quantities, dietary needs, and food safety controls",
+                (
+                    "Lock venue layout, participant walking flow, crowd control, "
+                    "signage, and wet-weather option"
+                ),
             ],
             operational_risk_level="Low",
         ),
@@ -1261,7 +2032,10 @@ def generate_demo_plan(brief: EventBrief) -> OperationsPlan:
             task_dependencies=[
                 "Publish volunteer roster, briefing pack, and escalation contacts",
                 "Run foot drill rehearsal and safety inspection",
-                "Confirm suppliers, deliveries, petty cash, and final budget position",
+                (
+                    "Confirm equipment checklist, sourcing, testing, setup, "
+                    "and return plan"
+                ),
             ],
             operational_risk_level="Critical",
             task_phase="Event-day delivery",
@@ -2175,6 +2949,8 @@ def tasks_to_dashboard_rows(tasks: Iterable[ActionableTask]) -> list[dict[str, o
             "risk": task.operational_risk_level,
             "dependency": "; ".join(task.task_dependencies),
             "task_phase": task.task_phase,
+            "ownership_review_required": task.ownership_review_required,
+            "ownership_review_reason": task.ownership_review_reason,
         }
         for task in tasks
     ]
@@ -2191,17 +2967,25 @@ def dashboard_rows_to_tasks(
     for row in rows:
         raw_dependencies = str(row.get("dependency", "") or "")
         dependencies = [part.strip() for part in raw_dependencies.split(";") if part.strip()]
+        owner = str(row.get("PIC", "") or "").strip()
+        review_required = bool(row.get("ownership_review_required", False))
+        review_reason = str(row.get("ownership_review_reason", "") or "").strip()
+        if owner != REVIEW_REQUIRED_OWNER:
+            review_required = False
+            review_reason = ""
         tasks.append(
             ActionableTask(
                 task_id=str(row.get("task_id", "") or "").strip(),
                 task=str(row.get("task", "") or "").strip(),
-                person_in_charge_role=str(row.get("PIC", "") or "").strip(),
+                person_in_charge_role=owner,
                 deadline=row.get("deadline"),
                 priority=str(row.get("priority", "Medium")),
                 current_status=str(row.get("status", "Not started")),
                 task_dependencies=dependencies,
                 operational_risk_level=str(row.get("risk", "Medium")),
                 task_phase=str(row.get("task_phase", "Pre-event")),
+                ownership_review_required=review_required,
+                ownership_review_reason=review_reason,
             )
         )
     tasks = ensure_task_ids(tasks)
@@ -2274,6 +3058,16 @@ def delete_task_from_plan(
                 "deadline_corrections": [
                     warning
                     for warning in plan.deadline_corrections
+                    if deleted_task.task not in warning
+                ],
+                "ownership_corrections": [
+                    warning
+                    for warning in plan.ownership_corrections
+                    if deleted_task.task not in warning
+                ],
+                "risk_corrections": [
+                    warning
+                    for warning in plan.risk_corrections
                     if deleted_task.task not in warning
                 ],
             }

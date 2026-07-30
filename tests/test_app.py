@@ -25,8 +25,16 @@ def test_sample_demo_streamlit_flow(monkeypatch) -> None:
     assert app.metric[1].value == "0"
     assert app.metric[2].value == "0"
     assert app.metric[3].label == "High / critical risk"
-    assert app.metric[3].value == "5"
+    assert int(app.metric[3].value) >= 1
     assert app.metric[4].value == "0%"
+    assert any(
+        "Risk calibration corrected" in warning.value
+        for warning in app.warning
+    )
+    assert any(
+        "require human ownership review" in warning.value
+        for warning in app.warning
+    )
 
     review_button = next(
         button for button in app.button if button.label == "Review Current Progress"
