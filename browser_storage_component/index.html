@@ -1,0 +1,334 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CivicOps AI browser storage bridge</title>
+    <style>
+      html, body { margin: 0; padding: 0; width: 0; height: 0; overflow: hidden; }
+    </style>
+  </head>
+  <body>
+    <script>
+      (() => {
+        "use strict";
+
+        const API_VERSION = 1;
+        const SCHEMA_VERSION = 1;
+        const PREFIX = "civicops-ai.v1.";
+        const INDEX_KEY = PREFIX + "project-index";
+        const ACTIVE_KEY = PREFIX + "active-project-id";
+        const PROJECT_PREFIX = PREFIX + "project.";
+        const PROJECT_ID = /^project-[0-9a-f]{32}$/;
+        const FORBIDDEN_KEYS = new Set([
+          "api_key", "openai_api_key", "streamlit_secrets", "secrets",
+          "secret", "token", "authentication_token", "password", "environment",
+          "environment_variables", "env", "model_configuration",
+          "billing_configuration", "deployment_credentials"
+        ]);
+        let lastRequestId = null;
+
+        function post(type, extra = {}) {
+          window.parent.postMessage(
+            { isStreamlitMessage: true, type, ...extra },
+            "*"
+          );
+        }
+
+        function setValue(value) {
+          post("streamlit:setComponentValue", { value });
+        }
+
+        function storageProbe() {
+          const key = PREFIX + "availability-probe";
+          localStorage.setItem(key, "1");
+          localStorage.removeItem(key);
+        }
+
+        function normaliseKey(value) {
+          return String(value)
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, "_")
+            .replace(/^_+|_+$/g, "");
+        }
+
+        function isForbiddenKey(value) {
+          const normalised = normaliseKey(value);
+          return FORBIDDEN_KEYS.has(normalised)
+            || normalised.endsWith("_api_key")
+            || normalised.endsWith("_token")
+            || normalised.endsWith("_secret")
+            || normalised.endsWith("_password")
+            || normalised.includes("credential");
+        }
+
+        function rejectForbiddenFields(value) {
+          if (Array.isArray(value)) {
+            value.forEach(rejectForbiddenFields);
+            return;
+          }
+          if (typeof value === "string") {
+            if (/\bsk-[A-Za-z0-9_-]{16,}\b/i.test(value)) {
+              throw new Error("Project text contains secret-shaped data.");
+            }
+            return;
+          }
+          if (!value || typeof value !== "object") return;
+          Object.entries(value).forEach(([key, child]) => {
+            if (isForbiddenKey(key)) {
+              throw new Error("Project snapshot contains a forbidden secret field.");
+            }
+            rejectForbiddenFields(child);
+          });
+        }
+
+        function byteLength(value) {
+          return new TextEncoder().encode(value).length;
+        }
+
+        function validateProjectId(projectId) {
+          if (typeof projectId !== "string" || !PROJECT_ID.test(projectId)) {
+            throw new Error("Project ID is invalid.");
+          }
+          return projectId;
+        }
+
+        function validateSummary(value) {
+          if (!value || typeof value !== "object") return null;
+          try {
+            const projectId = validateProjectId(value.project_id);
+            if (typeof value.project_name !== "string" || !value.project_name.trim()) {
+              return null;
+            }
+            if (typeof value.updated_at !== "string" || Number.isNaN(Date.parse(value.updated_at))) {
+              return null;
+            }
+            return {
+              schema_version: SCHEMA_VERSION,
+              project_id: projectId,
+              project_name: value.project_name.trim(),
+              updated_at: value.updated_at
+            };
+          } catch (_) {
+            return null;
+          }
+        }
+
+        function scanProjectSummaries() {
+          const projects = [];
+          for (let index = 0; index < localStorage.length; index += 1) {
+            const key = localStorage.key(index);
+            if (!key || !key.startsWith(PROJECT_PREFIX)) continue;
+            try {
+              const snapshot = JSON.parse(localStorage.getItem(key));
+              if (snapshot.schema_version !== SCHEMA_VERSION) continue;
+              const summary = validateSummary(snapshot);
+              if (summary && key === PROJECT_PREFIX + summary.project_id) {
+                projects.push(summary);
+              }
+            } catch (_) {
+              // An invalid snapshot is ignored without touching other projects.
+            }
+          }
+          return projects;
+        }
+
+        function readIndex() {
+          const raw = localStorage.getItem(INDEX_KEY);
+          if (raw === null) return { schema_version: SCHEMA_VERSION, projects: [] };
+          try {
+            const parsed = JSON.parse(raw);
+            if (parsed.schema_version !== SCHEMA_VERSION || !Array.isArray(parsed.projects)) {
+              throw new Error("Unsupported project index.");
+            }
+            const seen = new Set();
+            const projects = [];
+            parsed.projects.forEach((item) => {
+              const summary = validateSummary(item);
+              if (summary && !seen.has(summary.project_id)) {
+                seen.add(summary.project_id);
+                projects.push(summary);
+              }
+            });
+            return { schema_version: SCHEMA_VERSION, projects };
+          } catch (_) {
+            return { schema_version: SCHEMA_VERSION, projects: scanProjectSummaries() };
+          }
+        }
+
+        function writeIndex(projects) {
+          localStorage.setItem(
+            INDEX_KEY,
+            JSON.stringify({ schema_version: SCHEMA_VERSION, projects })
+          );
+        }
+
+        function sortedProjects(projects) {
+          return [...projects].sort((left, right) => {
+            const timeOrder = Date.parse(right.updated_at) - Date.parse(left.updated_at);
+            return timeOrder || right.project_id.localeCompare(left.project_id);
+          });
+        }
+
+        function responseBase(command, action) {
+          return { request_id: command.request_id, action, ok: true };
+        }
+
+        function hydrate(command) {
+          const index = readIndex();
+          const projects = sortedProjects(index.projects);
+          const activeProjectId = localStorage.getItem(ACTIVE_KEY);
+          const snapshotJson = activeProjectId && PROJECT_ID.test(activeProjectId)
+            ? localStorage.getItem(PROJECT_PREFIX + activeProjectId)
+            : null;
+          return {
+            ...responseBase(command, "hydrate"),
+            projects,
+            active_project_id: activeProjectId,
+            snapshot_json: snapshotJson
+          };
+        }
+
+        function save(command) {
+          const snapshotJson = command.snapshot_json;
+          const maxBytes = Number(command.max_snapshot_bytes) || 512000;
+          const maxProjects = Number(command.max_projects) || 20;
+          if (typeof snapshotJson !== "string" || byteLength(snapshotJson) > maxBytes) {
+            throw new Error(`Project exceeds the ${Math.floor(maxBytes / 1000)} KB storage limit.`);
+          }
+          const snapshot = JSON.parse(snapshotJson);
+          rejectForbiddenFields(snapshot);
+          if (snapshot.schema_version !== SCHEMA_VERSION) {
+            throw new Error("Project schema version is unsupported.");
+          }
+          const summary = validateSummary(snapshot);
+          if (!summary) throw new Error("Project metadata is invalid.");
+
+          const index = readIndex();
+          const existingPosition = index.projects.findIndex(
+            (item) => item.project_id === summary.project_id
+          );
+          if (existingPosition < 0 && index.projects.length >= maxProjects) {
+            throw new Error(`A maximum of ${maxProjects} local projects can be saved.`);
+          }
+
+          const projectKey = PROJECT_PREFIX + summary.project_id;
+          const previousProject = localStorage.getItem(projectKey);
+          const previousIndex = localStorage.getItem(INDEX_KEY);
+          const previousActive = localStorage.getItem(ACTIVE_KEY);
+          const projects = [...index.projects];
+          if (existingPosition >= 0) projects[existingPosition] = summary;
+          else projects.push(summary);
+          try {
+            localStorage.setItem(projectKey, snapshotJson);
+            writeIndex(projects);
+            localStorage.setItem(ACTIVE_KEY, summary.project_id);
+          } catch (error) {
+            try {
+              if (previousProject === null) localStorage.removeItem(projectKey);
+              else localStorage.setItem(projectKey, previousProject);
+              if (previousIndex === null) localStorage.removeItem(INDEX_KEY);
+              else localStorage.setItem(INDEX_KEY, previousIndex);
+              if (previousActive === null) localStorage.removeItem(ACTIVE_KEY);
+              else localStorage.setItem(ACTIVE_KEY, previousActive);
+            } catch (_) {
+              // Preserve the original actionable storage failure.
+            }
+            throw error;
+          }
+          return {
+            ...responseBase(command, "save"),
+            projects: sortedProjects(projects),
+            active_project_id: summary.project_id
+          };
+        }
+
+        function load(command) {
+          const projectId = validateProjectId(command.project_id);
+          const projects = sortedProjects(readIndex().projects);
+          if (!projects.some((item) => item.project_id === projectId)) {
+            throw new Error("The selected local project is not in the project index.");
+          }
+          const snapshotJson = localStorage.getItem(PROJECT_PREFIX + projectId);
+          if (snapshotJson === null) throw new Error("The selected local project is missing.");
+          localStorage.setItem(ACTIVE_KEY, projectId);
+          return {
+            ...responseBase(command, "load"),
+            projects,
+            active_project_id: projectId,
+            snapshot_json: snapshotJson
+          };
+        }
+
+        function remove(command) {
+          const projectId = validateProjectId(command.project_id);
+          if (command.confirmation_project_id !== projectId) {
+            throw new Error("Project deletion confirmation did not match.");
+          }
+          const index = readIndex();
+          if (!index.projects.some((item) => item.project_id === projectId)) {
+            throw new Error("The selected local project no longer exists.");
+          }
+          const remaining = sortedProjects(
+            index.projects.filter((item) => item.project_id !== projectId)
+          );
+          writeIndex(remaining);
+          localStorage.removeItem(PROJECT_PREFIX + projectId);
+
+          const priorActive = localStorage.getItem(ACTIVE_KEY);
+          let activeProjectId = priorActive;
+          let snapshotJson = null;
+          if (priorActive === projectId) {
+            activeProjectId = remaining.length ? remaining[0].project_id : null;
+            if (activeProjectId) {
+              localStorage.setItem(ACTIVE_KEY, activeProjectId);
+              snapshotJson = localStorage.getItem(PROJECT_PREFIX + activeProjectId);
+            } else {
+              localStorage.removeItem(ACTIVE_KEY);
+            }
+          }
+          return {
+            ...responseBase(command, "delete"),
+            projects: remaining,
+            deleted_project_id: projectId,
+            active_project_id: activeProjectId,
+            snapshot_json: snapshotJson
+          };
+        }
+
+        function handleRender(event) {
+          if (!event.data || event.data.type !== "streamlit:render") return;
+          const command = event.data.args && event.data.args.command;
+          if (!command || command.action === "idle" || !command.request_id) return;
+          if (command.request_id === lastRequestId) return;
+          lastRequestId = command.request_id;
+          try {
+            storageProbe();
+            let result;
+            if (command.action === "hydrate") result = hydrate(command);
+            else if (command.action === "save") result = save(command);
+            else if (command.action === "load") result = load(command);
+            else if (command.action === "delete") result = remove(command);
+            else throw new Error("Browser storage command is unsupported.");
+            setValue(result);
+          } catch (error) {
+            const name = error && error.name ? String(error.name) : "StorageError";
+            const quota = name === "QuotaExceededError" || name === "NS_ERROR_DOM_QUOTA_REACHED";
+            setValue({
+              request_id: command.request_id,
+              action: command.action,
+              ok: false,
+              error: quota
+                ? "Browser storage quota was exceeded. Delete a local project or export a backup."
+                : "Browser storage is unavailable, blocked, or contains invalid project data."
+            });
+          }
+        }
+
+        window.addEventListener("message", handleRender);
+        post("streamlit:componentReady", { apiVersion: API_VERSION });
+        post("streamlit:setFrameHeight", { height: 0 });
+      })();
+    </script>
+  </body>
+</html>

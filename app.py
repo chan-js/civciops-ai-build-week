@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
@@ -36,10 +39,36 @@ from ai_service import (
     summarise_downstream_impacts,
     tasks_to_dashboard_rows,
 )
+from project_persistence import (
+    MAX_LOCAL_PROJECTS,
+    MAX_SNAPSHOT_BYTES,
+    CommitteeRoleState,
+    EventBriefState,
+    ProjectMetadata,
+    ProjectPersistenceError,
+    ProjectSnapshot,
+    ProjectSummary,
+    create_blank_project,
+    deterministic_snapshot_json,
+    duplicate_project,
+    parse_project_json,
+    resolve_imported_project,
+    safe_project_filename,
+    snapshot_content_fingerprint,
+    touch_snapshot,
+    unique_project_name,
+    utc_now,
+    validate_project_name,
+)
 from sample_data import SAMPLE_EVENT
 
 
 load_dotenv()
+
+_browser_storage = components.declare_component(
+    "civicops_browser_storage",
+    path=str(Path(__file__).with_name("browser_storage_component")),
+)
 
 st.set_page_config(
     page_title="CivicOps AI",
@@ -82,6 +111,7 @@ st.markdown(
 
 
 def initialise_state() -> None:
+    blank_project = create_blank_project()
     defaults: dict[str, object] = {
         "organisation_type": "Volunteer organisation",
         "event_name": "",
@@ -101,10 +131,416 @@ def initialise_state() -> None:
         "task_signature": None,
         "pending_delete_task_id": None,
         "task_mutation_notice": None,
+        "project_id": blank_project.project_id,
+        "project_name": blank_project.project_name,
+        "project_created_at": blank_project.created_at,
+        "project_updated_at": blank_project.updated_at,
+        "project_last_saved_at": None,
+        "project_catalog": [],
+        "project_dirty": False,
+        "project_saved_fingerprint": None,
+        "project_save_status": "Loading projects",
+        "project_validation_error": None,
+        "persistence_phase": "pending",
+        "storage_available": None,
+        "storage_error": None,
+        "storage_notice": None,
+        "autosave_blocked": False,
+        "processed_storage_response_ids": [],
+        "storage_command": {
+            "action": "hydrate",
+            "request_id": f"request-{uuid4().hex}",
+        },
+        "pending_session_snapshot_json": None,
+        "pending_session_snapshot_restored": False,
+        "pending_session_snapshot_message": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def source_mode(source: object) -> str:
+    """Reduce source labels to safe persistence metadata categories."""
+
+    normalised = str(source or "").casefold()
+    if "fallback" in normalised:
+        return "fallback"
+    if "openai" in normalised or "ai-generated" in normalised:
+        return "ai"
+    if "demo" in normalised:
+        return "demo"
+    return "unknown"
+
+
+def restored_source_label(mode: str, *, review: bool = False) -> str | None:
+    if mode == "ai":
+        return "Restored AI-generated review (no API call)" if review else (
+            "Restored AI-generated plan (no API call)"
+        )
+    if mode == "demo":
+        return "Restored Deterministic Demo Mode"
+    if mode == "fallback":
+        return "Restored deterministic fallback (no API call)"
+    return "Restored project snapshot" if not review else "Restored project review"
+
+
+def current_project_snapshot() -> ProjectSnapshot:
+    """Validate the exact editable Streamlit state as a portable snapshot."""
+
+    committee = [
+        CommitteeRoleState.model_validate(row)
+        for row in st.session_state.committee_structure
+    ]
+    brief = EventBriefState(
+        organisation_type=st.session_state.organisation_type,
+        event_name=st.session_state.event_name,
+        event_objective=st.session_state.event_objective,
+        current_planning_date=st.session_state.current_planning_date,
+        event_date=st.session_state.event_date,
+        venue=st.session_state.venue,
+        expected_participants=st.session_state.expected_participants,
+        available_budget=st.session_state.available_budget,
+        committee_size=st.session_state.committee_size,
+        committee_structure=committee,
+        constraints_and_special_requirements=(
+            st.session_state.constraints_and_special_requirements
+        ),
+    )
+    plan: OperationsPlan | None = st.session_state.operations_plan
+    review: ProgressReview | None = st.session_state.progress_review
+    plan_mode = source_mode(st.session_state.plan_source)
+    review_mode = source_mode(st.session_state.review_source)
+    mode = plan_mode if plan_mode != "unknown" else review_mode
+    return ProjectSnapshot(
+        project_id=st.session_state.project_id,
+        project_name=st.session_state.project_name,
+        created_at=st.session_state.project_created_at,
+        updated_at=st.session_state.project_updated_at,
+        event_brief=brief,
+        operations_plan=plan,
+        progress_review=review,
+        metadata=ProjectMetadata(
+            mode=mode,
+            plan_source=plan_mode,
+            review_source=review_mode,
+        ),
+    )
+
+
+def apply_project_snapshot(
+    snapshot: ProjectSnapshot, *, restored: bool, saved: bool
+) -> None:
+    """Hydrate session state without generating a plan or calling an API."""
+
+    brief = snapshot.event_brief
+    st.session_state.organisation_type = brief.organisation_type
+    st.session_state.event_name = brief.event_name
+    st.session_state.event_objective = brief.event_objective
+    st.session_state.current_planning_date = brief.current_planning_date
+    st.session_state.event_date = brief.event_date
+    st.session_state.venue = brief.venue
+    st.session_state.expected_participants = brief.expected_participants
+    st.session_state.available_budget = brief.available_budget
+    st.session_state.committee_size = brief.committee_size
+    st.session_state.committee_structure = [
+        row.model_dump(mode="python") for row in brief.committee_structure
+    ]
+    st.session_state.constraints_and_special_requirements = (
+        brief.constraints_and_special_requirements
+    )
+    st.session_state.operations_plan = snapshot.operations_plan
+    st.session_state.progress_review = snapshot.progress_review
+    st.session_state.plan_source = (
+        restored_source_label(snapshot.metadata.plan_source)
+        if snapshot.operations_plan is not None
+        else None
+    )
+    st.session_state.review_source = (
+        restored_source_label(snapshot.metadata.review_source, review=True)
+        if snapshot.progress_review is not None
+        else None
+    )
+    st.session_state.project_id = snapshot.project_id
+    st.session_state.project_name = snapshot.project_name
+    st.session_state.project_created_at = snapshot.created_at
+    st.session_state.project_updated_at = snapshot.updated_at
+    st.session_state.project_last_saved_at = snapshot.updated_at if saved else None
+    st.session_state.project_saved_fingerprint = (
+        snapshot_content_fingerprint(snapshot) if saved else None
+    )
+    st.session_state.project_dirty = not saved
+    st.session_state.project_save_status = "Saved" if saved else "Unsaved changes"
+    st.session_state.project_validation_error = None
+    st.session_state.autosave_blocked = False
+    st.session_state.task_signature = (
+        task_signature(snapshot.operations_plan)
+        if snapshot.operations_plan is not None
+        else None
+    )
+    st.session_state.pending_delete_task_id = None
+    st.session_state.task_mutation_notice = None
+    for widget_key in (
+        "task_editor",
+        "committee_editor",
+        "project_selector",
+        "confirm_project_delete",
+    ):
+        st.session_state.pop(widget_key, None)
+    if restored:
+        st.session_state.storage_notice = (
+            f"Restored “{snapshot.project_name}” from this browser without an API call."
+        )
+
+
+def queue_session_snapshot(
+    snapshot: ProjectSnapshot, *, restored: bool, message: str
+) -> None:
+    """Defer a project transition until the next rerun, before widgets render."""
+
+    st.session_state.pending_session_snapshot_json = deterministic_snapshot_json(
+        snapshot
+    )
+    st.session_state.pending_session_snapshot_restored = restored
+    st.session_state.pending_session_snapshot_message = message
+
+
+def apply_pending_session_snapshot() -> None:
+    payload = st.session_state.pending_session_snapshot_json
+    if not isinstance(payload, str):
+        return
+    restored = bool(st.session_state.pending_session_snapshot_restored)
+    message = st.session_state.pending_session_snapshot_message
+    st.session_state.pending_session_snapshot_json = None
+    st.session_state.pending_session_snapshot_restored = False
+    st.session_state.pending_session_snapshot_message = None
+    snapshot = parse_project_json(payload)
+    apply_project_snapshot(snapshot, restored=restored, saved=False)
+    if isinstance(message, str):
+        st.session_state.storage_notice = message
+
+
+def _safe_storage_error(action: str, response: dict[str, object]) -> str:
+    raw = str(response.get("error", "")).casefold()
+    if "quota" in raw or "maximum" in raw:
+        return (
+            "Browser storage is full. Delete a local project or export a backup, "
+            "then try Save Now again."
+        )
+    if action == "hydrate":
+        return (
+            "Browser storage is unavailable or blocked. The app remains usable; "
+            "use full-project JSON export and import for recovery."
+        )
+    return (
+        "The browser could not complete the local project operation. "
+        "Export a project backup and try again."
+    )
+
+
+def _validated_catalog(response: dict[str, object]) -> list[dict[str, object]]:
+    summaries: list[ProjectSummary] = []
+    seen: set[str] = set()
+    raw_projects = response.get("projects", [])
+    if not isinstance(raw_projects, list):
+        return []
+    for item in raw_projects:
+        try:
+            summary = ProjectSummary.model_validate(item)
+        except Exception:
+            continue
+        if summary.project_id in seen:
+            continue
+        seen.add(summary.project_id)
+        summaries.append(summary)
+    summaries.sort(
+        key=lambda item: (item.updated_at, item.project_id), reverse=True
+    )
+    return [item.model_dump(mode="json") for item in summaries]
+
+
+def handle_storage_response(response: object) -> None:
+    """Apply one browser response exactly once and never trust unvalidated data."""
+
+    if not isinstance(response, dict):
+        return
+    request_id = response.get("request_id")
+    if not isinstance(request_id, str):
+        return
+    processed: list[str] = st.session_state.processed_storage_response_ids
+    if request_id in processed:
+        return
+    processed.append(request_id)
+    del processed[:-30]
+
+    command = st.session_state.storage_command
+    action = str(response.get("action") or command.get("action") or "")
+    matching_command = command if command.get("request_id") == request_id else {}
+    st.session_state.storage_command = {"action": "idle", "request_id": request_id}
+
+    if response.get("ok") is not True:
+        message = _safe_storage_error(action, response)
+        st.session_state.storage_error = message
+        st.session_state.project_save_status = "Storage error"
+        st.session_state.autosave_blocked = True
+        if action == "hydrate":
+            st.session_state.persistence_phase = "failed"
+            st.session_state.storage_available = False
+        return
+
+    st.session_state.storage_available = True
+    st.session_state.project_catalog = _validated_catalog(response)
+    st.session_state.storage_error = None
+
+    if action == "hydrate":
+        st.session_state.persistence_phase = "ready"
+        snapshot_json = response.get("snapshot_json")
+        if isinstance(snapshot_json, str):
+            try:
+                snapshot = parse_project_json(snapshot_json)
+            except ProjectPersistenceError:
+                st.session_state.storage_error = (
+                    "The last active project is invalid and was not loaded. "
+                    "Other valid saved projects remain available."
+                )
+                st.session_state.project_save_status = "Storage error"
+                st.session_state.autosave_blocked = True
+                return
+            apply_project_snapshot(snapshot, restored=True, saved=True)
+        elif response.get("active_project_id"):
+            st.session_state.storage_error = (
+                "The last active project is missing. Other valid saved projects "
+                "remain available."
+            )
+            st.session_state.project_save_status = "Storage error"
+            st.session_state.autosave_blocked = True
+        else:
+            st.session_state.project_dirty = True
+            st.session_state.project_save_status = "Unsaved changes"
+        return
+
+    if action == "load":
+        snapshot_json = response.get("snapshot_json")
+        if not isinstance(snapshot_json, str):
+            st.session_state.storage_error = (
+                "The selected project is missing and the current project was unchanged."
+            )
+            st.session_state.project_save_status = "Storage error"
+            return
+        try:
+            snapshot = parse_project_json(snapshot_json)
+        except ProjectPersistenceError:
+            st.session_state.storage_error = (
+                "The selected project is invalid and the current project was unchanged."
+            )
+            st.session_state.project_save_status = "Storage error"
+            return
+        apply_project_snapshot(snapshot, restored=True, saved=True)
+        return
+
+    if action == "save":
+        saved_json = matching_command.get("snapshot_json")
+        if not isinstance(saved_json, str):
+            st.session_state.storage_error = "The completed save could not be verified."
+            st.session_state.project_save_status = "Storage error"
+            return
+        try:
+            saved_snapshot = parse_project_json(saved_json)
+        except ProjectPersistenceError:
+            st.session_state.storage_error = "The completed save could not be verified."
+            st.session_state.project_save_status = "Storage error"
+            return
+        st.session_state.project_name = saved_snapshot.project_name
+        st.session_state.project_updated_at = saved_snapshot.updated_at
+        st.session_state.project_last_saved_at = saved_snapshot.updated_at
+        st.session_state.project_saved_fingerprint = snapshot_content_fingerprint(
+            saved_snapshot
+        )
+        st.session_state.project_dirty = False
+        st.session_state.project_save_status = "Saved"
+        st.session_state.autosave_blocked = False
+        return
+
+    if action == "delete":
+        deleted_id = response.get("deleted_project_id")
+        if deleted_id == st.session_state.project_id:
+            snapshot_json = response.get("snapshot_json")
+            if isinstance(snapshot_json, str):
+                try:
+                    apply_project_snapshot(
+                        parse_project_json(snapshot_json), restored=True, saved=True
+                    )
+                    st.session_state.storage_notice = (
+                        "Project deleted. The most recently saved remaining project "
+                        "was loaded."
+                    )
+                    return
+                except ProjectPersistenceError:
+                    pass
+            existing_names = {
+                str(item["project_name"])
+                for item in st.session_state.project_catalog
+                if "project_name" in item
+            }
+            blank = create_blank_project(
+                unique_project_name("Untitled project", existing_names)
+            )
+            apply_project_snapshot(blank, restored=False, saved=False)
+            st.session_state.storage_notice = (
+                "Project deleted. A new blank project is ready."
+            )
+
+
+def sync_browser_storage() -> None:
+    """Render the zero-height component and consume any completed operation."""
+
+    response = _browser_storage(
+        command=st.session_state.storage_command,
+        default=None,
+        key="civicops_browser_storage_bridge",
+    )
+    handle_storage_response(response)
+
+
+def queue_storage_command(action: str, **values: object) -> None:
+    st.session_state.storage_command = {
+        "action": action,
+        "request_id": f"request-{uuid4().hex}",
+        **values,
+    }
+
+
+def queue_project_save(*, manual: bool) -> bool:
+    """Validate and queue one idempotent browser write."""
+
+    try:
+        snapshot = touch_snapshot(current_project_snapshot())
+        snapshot_json = deterministic_snapshot_json(snapshot)
+    except (ProjectPersistenceError, ValidationError, TypeError, ValueError):
+        st.session_state.project_validation_error = (
+            "Project data is invalid and was not saved. Correct the highlighted "
+            "project, event, committee, or task value and try again."
+        )
+        st.session_state.project_dirty = True
+        st.session_state.project_save_status = "Unsaved changes"
+        return False
+    if st.session_state.storage_available is not True:
+        st.session_state.storage_error = (
+            "Browser storage is unavailable. Export a full-project JSON backup instead."
+        )
+        st.session_state.project_save_status = "Storage error"
+        return False
+    if manual:
+        st.session_state.autosave_blocked = False
+    queue_storage_command(
+        "save",
+        snapshot_json=snapshot_json,
+        max_snapshot_bytes=MAX_SNAPSHOT_BYTES,
+        max_projects=MAX_LOCAL_PROJECTS,
+    )
+    st.session_state.project_save_status = "Saving"
+    st.session_state.project_validation_error = None
+    return True
 
 
 def load_sample() -> None:
@@ -840,10 +1276,325 @@ def render_exports(plan: OperationsPlan) -> None:
         mime="application/json",
         width="stretch",
     )
+    st.caption(
+        "For refresh/reopen recovery, use the distinct full-project JSON backup "
+        "in the Project section of the sidebar."
+    )
+
+
+def _catalog_names() -> dict[str, str]:
+    return {
+        str(item["project_id"]): str(item["project_name"])
+        for item in st.session_state.project_catalog
+        if "project_id" in item and "project_name" in item
+    }
+
+
+def _current_project_is_saved() -> bool:
+    """Recheck at action time so a same-rerun edit cannot be discarded."""
+
+    try:
+        fingerprint = snapshot_content_fingerprint(current_project_snapshot())
+    except (ProjectPersistenceError, ValidationError, TypeError, ValueError):
+        st.session_state.project_validation_error = (
+            "Correct invalid project data and save before switching projects."
+        )
+        st.session_state.project_dirty = True
+        st.session_state.project_save_status = "Unsaved changes"
+        return False
+    if fingerprint != st.session_state.project_saved_fingerprint:
+        st.session_state.project_dirty = True
+        st.session_state.project_save_status = "Unsaved changes"
+        st.session_state.storage_notice = (
+            "Save the current project before switching or creating another."
+        )
+        return False
+    return True
+
+
+def _start_new_project() -> None:
+    existing_names = set(_catalog_names().values())
+    name = unique_project_name("Untitled project", existing_names)
+    queue_session_snapshot(
+        create_blank_project(name),
+        restored=False,
+        message=(
+            "A new project was created. The previous saved project remains available."
+        ),
+    )
+
+
+def _duplicate_current_project() -> None:
+    snapshot = current_project_snapshot()
+    duplicate = duplicate_project(snapshot, set(_catalog_names().values()))
+    queue_session_snapshot(
+        duplicate,
+        restored=False,
+        message=f"Created “{duplicate.project_name}” with a separate project ID.",
+    )
+
+
+def _import_uploaded_project(uploaded_file: object) -> None:
+    """Validate the whole upload before applying any session-state mutation."""
+
+    size = int(getattr(uploaded_file, "size", MAX_SNAPSHOT_BYTES + 1))
+    if size > MAX_SNAPSHOT_BYTES:
+        raise ProjectPersistenceError(
+            f"Project import exceeds the {MAX_SNAPSHOT_BYTES // 1_000} KB limit."
+        )
+    payload = uploaded_file.getvalue()
+    imported = parse_project_json(payload)
+    existing = _catalog_names()
+    existing_ids = set(existing)
+    existing_ids.add(st.session_state.project_id)
+    resolved = resolve_imported_project(
+        imported,
+        existing_ids,
+        set(existing.values()) | {st.session_state.project_name},
+    )
+    queue_session_snapshot(
+        resolved,
+        restored=True,
+        message=f"Imported “{resolved.project_name}”. Save or export it as needed.",
+    )
+
+
+def render_project_sidebar() -> None:
+    """Render browser-local project controls after primary workflow buttons."""
+
+    with st.sidebar:
+        st.divider()
+        st.markdown("### Project")
+        st.caption(
+            "Projects are saved locally in this browser and device. Export a "
+            "project backup before clearing browser data or moving to another device."
+        )
+
+        if st.session_state.persistence_phase == "pending":
+            st.info("Loading browser projects before local autosave starts…")
+            return
+
+        st.text_input(
+            "Current project name",
+            key="project_name",
+            max_chars=80,
+        )
+        try:
+            validate_project_name(st.session_state.project_name)
+        except ProjectPersistenceError as exc:
+            st.error(str(exc))
+
+        status = st.session_state.project_save_status
+        if status == "Saved":
+            st.success("Saved")
+        elif status == "Saving":
+            st.info("Saving")
+        elif status == "Storage error":
+            st.error("Storage error")
+        else:
+            st.warning("Unsaved changes")
+        last_saved = st.session_state.project_last_saved_at
+        if isinstance(last_saved, datetime):
+            local_saved = last_saved.astimezone()
+            st.caption(f"Last saved: {local_saved.strftime('%d %b %Y, %H:%M:%S %Z')}")
+        else:
+            st.caption("Last saved: not yet saved")
+
+        if st.session_state.storage_notice:
+            st.info(st.session_state.storage_notice)
+            st.session_state.storage_notice = None
+        if st.session_state.storage_error:
+            st.warning(st.session_state.storage_error)
+        if st.session_state.project_validation_error:
+            st.warning(st.session_state.project_validation_error)
+
+        storage_ready = (
+            st.session_state.persistence_phase == "ready"
+            and st.session_state.storage_available is True
+        )
+        command_idle = st.session_state.storage_command.get("action") == "idle"
+
+        if storage_ready:
+            save_col, new_col = st.columns(2)
+            if save_col.button(
+                "Save now",
+                key="save_project_now",
+                disabled=not command_idle,
+                width="stretch",
+            ):
+                if queue_project_save(manual=True):
+                    st.rerun()
+            if new_col.button(
+                "New project",
+                key="new_local_project",
+                disabled=st.session_state.project_dirty or not command_idle,
+                width="stretch",
+            ):
+                if _current_project_is_saved():
+                    _start_new_project()
+                    st.rerun()
+            if st.session_state.project_dirty:
+                st.caption("Save the current project before switching or creating another.")
+
+            if st.button(
+                "Save a copy / duplicate project",
+                key="duplicate_local_project",
+                disabled=st.session_state.project_dirty or not command_idle,
+                width="stretch",
+            ):
+                if _current_project_is_saved():
+                    try:
+                        _duplicate_current_project()
+                    except (ProjectPersistenceError, ValidationError, TypeError, ValueError):
+                        st.session_state.project_validation_error = (
+                            "The project could not be duplicated until its invalid data is corrected."
+                        )
+                    else:
+                        st.rerun()
+
+            names = _catalog_names()
+            project_ids = list(names)
+            if project_ids:
+                if st.session_state.project_id in project_ids:
+                    default_index = project_ids.index(st.session_state.project_id)
+                else:
+                    default_index = 0
+                selected_id = st.selectbox(
+                    "Existing local projects",
+                    options=project_ids,
+                    index=default_index,
+                    format_func=lambda project_id: names.get(project_id, "Unknown project"),
+                    key="project_selector",
+                )
+                if st.button(
+                    "Load selected project",
+                    key="load_local_project",
+                    disabled=(
+                        st.session_state.project_dirty
+                        or not command_idle
+                        or selected_id == st.session_state.project_id
+                    ),
+                    width="stretch",
+                ):
+                    if _current_project_is_saved():
+                        queue_storage_command("load", project_id=selected_id)
+                        st.rerun()
+            else:
+                st.caption("No saved local projects yet.")
+
+            with st.expander("Delete current project"):
+                st.warning(
+                    f"Delete “{st.session_state.project_name}” from this browser?"
+                )
+                confirmed = st.checkbox(
+                    "I confirm this exact project should be deleted.",
+                    key="confirm_project_delete",
+                )
+                if st.button(
+                    "Delete confirmed project",
+                    key="delete_local_project",
+                    disabled=not confirmed or not command_idle,
+                    width="stretch",
+                ):
+                    target_id = st.session_state.project_id
+                    queue_storage_command(
+                        "delete",
+                        project_id=target_id,
+                        confirmation_project_id=target_id,
+                    )
+                    st.rerun()
+        else:
+            st.warning(
+                "Local browser storage controls are unavailable. Full-project JSON "
+                "export and import remain available below."
+            )
+
+        st.markdown("#### Full-project backup")
+        try:
+            export_snapshot = touch_snapshot(current_project_snapshot())
+            export_json = deterministic_snapshot_json(export_snapshot)
+        except (ProjectPersistenceError, ValidationError, TypeError, ValueError):
+            st.warning(
+                "Correct invalid project data before exporting a full-project backup."
+            )
+        else:
+            st.download_button(
+                "Export full project JSON",
+                data=export_json,
+                file_name=safe_project_filename(export_snapshot),
+                mime="application/json",
+                key="export_full_project",
+                width="stretch",
+            )
+
+        uploaded = st.file_uploader(
+            "Import full project JSON",
+            type=["json"],
+            accept_multiple_files=False,
+            key="full_project_import",
+            help=f"Maximum file size: {MAX_SNAPSHOT_BYTES // 1_000} KB.",
+        )
+        if st.button(
+            "Validate and import project",
+            key="import_full_project",
+            disabled=uploaded is None,
+            width="stretch",
+        ):
+            try:
+                _import_uploaded_project(uploaded)
+            except ProjectPersistenceError as exc:
+                st.error(str(exc))
+            except Exception:
+                st.error(
+                    "Project import failed validation. The current project was unchanged."
+                )
+            else:
+                if storage_ready:
+                    st.session_state.autosave_blocked = False
+                st.rerun()
+
+
+def finalise_project_autosave() -> None:
+    """Detect meaningful committed edits and queue at most one validated write."""
+
+    if st.session_state.persistence_phase == "pending":
+        return
+    try:
+        snapshot = current_project_snapshot()
+        fingerprint = snapshot_content_fingerprint(snapshot)
+    except (ProjectPersistenceError, ValidationError, TypeError, ValueError):
+        st.session_state.project_dirty = True
+        if st.session_state.project_save_status != "Storage error":
+            st.session_state.project_save_status = "Unsaved changes"
+        st.session_state.project_validation_error = (
+            "Project data is invalid and autosave is paused until it is corrected."
+        )
+        return
+
+    saved_fingerprint = st.session_state.project_saved_fingerprint
+    if fingerprint == saved_fingerprint:
+        st.session_state.project_dirty = False
+        if st.session_state.project_save_status not in {"Saving", "Storage error"}:
+            st.session_state.project_save_status = "Saved"
+        return
+
+    st.session_state.project_dirty = True
+    if st.session_state.project_save_status != "Storage error":
+        st.session_state.project_save_status = "Unsaved changes"
+    if (
+        st.session_state.persistence_phase == "ready"
+        and st.session_state.storage_available is True
+        and st.session_state.storage_command.get("action") == "idle"
+        and not st.session_state.autosave_blocked
+    ):
+        if queue_project_save(manual=False):
+            st.rerun()
 
 
 def main() -> None:
     initialise_state()
+    apply_pending_session_snapshot()
+    sync_browser_storage()
     render_sidebar()
     st.markdown(
         """
@@ -871,6 +1622,8 @@ def main() -> None:
         st.info(
             "Complete the event brief or load the Bacang Youth sample, then generate a plan."
         )
+        render_project_sidebar()
+        finalise_project_autosave()
         return
 
     st.divider()
@@ -922,6 +1675,8 @@ def main() -> None:
     render_review(plan)
     render_risks_and_actions(plan)
     render_exports(plan)
+    render_project_sidebar()
+    finalise_project_autosave()
 
 
 if __name__ == "__main__":

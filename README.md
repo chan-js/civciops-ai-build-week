@@ -25,6 +25,10 @@ Small community teams often coordinate important events through a mixture of Wha
 - Live metrics for total, completed, blocked, high-risk tasks, and completion percentage
 - Progress review based on the edited dashboard rather than the original plan
 - Risk register, recommended next actions, CSV task export, and JSON plan export
+- Browser-local named projects with controlled autosave, refresh/reopen recovery,
+  duplication, switching, and confirmed deletion
+- Versioned full-project JSON backup and validated import, independent of the
+  existing task CSV and operations-plan JSON exports
 - Clear API-error fallback that keeps the complete workflow usable
 
 ## Architecture
@@ -39,14 +43,39 @@ Streamlit interface (app.py)
         +-- Demo Mode --> deterministic local planner --> same Pydantic schemas
         |
         +-- editable dashboard --> validated task models --> metrics, review, exports
+        |
+        +-- ProjectSnapshot schema --> static first-party browser component
+                                      --> namespaced localStorage keys
 ```
 
 - `app.py` contains the Streamlit presentation and session workflow.
 - `ai_service.py` contains all schemas, OpenAI calls, deterministic planning, progress analysis, and dashboard transformations.
+- `project_persistence.py` contains the versioned snapshot schema, deterministic
+  JSON boundary, project-management helpers, lifecycle state machine, and
+  storage-adapter implementation used by unit tests.
+- `browser_storage_component/index.html` is a zero-build, repository-contained
+  localStorage bridge. It needs no Node.js runtime in production.
 - `sample_data.py` contains the supplied Build Week sample event.
 - `tests/test_core.py` verifies the offline sample flow, dashboard edits, metrics, review, and JSON serialisation.
 
-No database or external messaging integration is claimed or required for this MVP.
+No server database, cloud project store, user account, or external messaging
+integration is claimed or required for this MVP.
+
+## Local project recovery
+
+Projects are saved only in the current browser profile and device. The app first
+hydrates the last active validated snapshot, then enables autosave; blank defaults
+cannot be written while hydration is pending. A storage warning leaves the app
+usable with the full-project JSON export/import fallback.
+
+Browser keys use the `civicops-ai.v1.` namespace. Each snapshot is capped at
+512 KB, the local catalog is capped at 20 projects, and imported JSON is parsed as
+data only through strict Pydantic models. Snapshots contain safe Demo/AI/fallback
+provenance categories, not API keys, secrets, environment variables, model
+configuration, tokens, or deployment credentials.
+
+See [Sprint 3 persistence and manual acceptance](docs/SPRINT_3_PERSISTENCE.md)
+for the schema migration contract and browser test checklist.
 
 ## Setup
 
@@ -144,7 +173,7 @@ Codex assisted with implementation and debugging, while the product concept, eve
 
 ## Testing
 
-The final implementation passed **39 automated tests** covering:
+The canonical suite covers:
 
 - Core deterministic planning
 - Dashboard edits and metrics
@@ -154,17 +183,21 @@ The final implementation passed **39 automated tests** covering:
 - Timeout configuration
 - Controlled retry behaviour
 - Prevention of secret or traceback exposure
+- Sprint 1 task add/delete, dependency cleanup, and deadline safety
+- Sprint 2 committee-role, responsibility, ownership, and risk fidelity
+- Sprint 3 snapshot round trips, browser-store semantics, import safety,
+  hydration gating, autosave transitions, and fallback recovery
 
 Run all offline tests:
 
 ```powershell
-python -m pytest -q
+python -m pytest tests -q
 ```
 
 Run a syntax check:
 
 ```powershell
-python -m compileall app.py ai_service.py sample_data.py tests
+python -m compileall app.py ai_service.py project_persistence.py sample_data.py tests
 ```
 
 Run a headless startup smoke test:
@@ -177,7 +210,10 @@ The automated tests require no API key and do not make network requests. A live 
 
 ## Limitations
 
-- The MVP keeps state in the current Streamlit session; it has no user accounts, shared persistence, or collaborative editing.
+- Projects persist only in the same browser profile and device; there is no
+  cross-device synchronisation, shared persistence, or collaborative editing.
+- Clearing browser data removes local projects unless the user exported a
+  full-project JSON backup.
 - Dependencies are displayed as task-name references and are not a full project-scheduling engine.
 - AI recommendations still require committee judgement, especially for safeguarding, medical, legal, food-safety, and venue decisions.
 - No WhatsApp, email, calendar, payment, school system, or supplier integration is implemented.
@@ -187,7 +223,7 @@ The automated tests require no API key and do not make network requests. A live 
 ## Future development
 
 - Secure team workspaces with role-based access and an audit trail
-- Persistent plans, version history, comments, and notifications
+- Cloud-synchronised team plans, version history, comments, and notifications
 - Calendar and messaging integrations with explicit user authorisation
 - Dependency graph and critical-path views
 - Budget ledger and procurement approval workflow
