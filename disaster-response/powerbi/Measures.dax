@@ -1,0 +1,8 @@
+// Create these as individual measures on the CommunityPlan table.
+Total Demand = SUM(CommunityPlan[population])
+Assigned People = SUM(CommunityPlan[assigned])
+Unassigned People = SUM(CommunityPlan[unassigned])
+Allocation Coverage = DIVIDE([Assigned People], [Total Demand], 0)
+Priority Gap = SUM(CommunityPlan[priority_unassigned])
+// Add a report banner sourced from scenario_metadata: SYNTHETIC EXERCISE.
+// Coverage is a model allocation metric, not an observed rescue success rate.

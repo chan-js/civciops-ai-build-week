@@ -1,0 +1,548 @@
+{
+  "model_version": "0.1.0",
+  "mode": "synthetic_exercise",
+  "as_of": "2026-11-10T09:00:00+08:00",
+  "options": {
+    "pressure": 1,
+    "horizon_minutes": 60,
+    "risk_limit": 0.72,
+    "congestion": 1.0,
+    "shelter_scale": 1.0,
+    "closed_roads": [],
+    "closed_shelters": [],
+    "accessible_only": true,
+    "max_age_minutes": 120
+  },
+  "objective": "maximize total assigned, then priority assigned, then minimize assumed travel+risk cost",
+  "total_demand": 1460,
+  "assigned": 1260,
+  "unassigned": 200,
+  "priority_assigned": 400,
+  "routes": [
+    {
+      "community": "Z1",
+      "shelter": "P1",
+      "priority": true,
+      "people": 90,
+      "roads": [
+        "R01",
+        "R12"
+      ],
+      "minutes": 15.0
+    },
+    {
+      "community": "Z1",
+      "shelter": "P1",
+      "priority": false,
+      "people": 150,
+      "roads": [
+        "R01",
+        "R12"
+      ],
+      "minutes": 15.0
+    },
+    {
+      "community": "Z2",
+      "shelter": "P1",
+      "priority": true,
+      "people": 65,
+      "roads": [
+        "R03",
+        "R12"
+      ],
+      "minutes": 13.0
+    },
+    {
+      "community": "Z2",
+      "shelter": "P1",
+      "priority": false,
+      "people": 75,
+      "roads": [
+        "R03",
+        "R12"
+      ],
+      "minutes": 13.0
+    },
+    {
+      "community": "Z2",
+      "shelter": "P1",
+      "priority": false,
+      "people": 40,
+      "roads": [
+        "R04",
+        "R15"
+      ],
+      "minutes": 14.0
+    },
+    {
+      "community": "Z3",
+      "shelter": "P3",
+      "priority": true,
+      "people": 110,
+      "roads": [
+        "R06",
+        "R17"
+      ],
+      "minutes": 18.0
+    },
+    {
+      "community": "Z3",
+      "shelter": "P3",
+      "priority": false,
+      "people": 50,
+      "roads": [
+        "R06",
+        "R17"
+      ],
+      "minutes": 18.0
+    },
+    {
+      "community": "Z5",
+      "shelter": "P3",
+      "priority": true,
+      "people": 85,
+      "roads": [
+        "R09",
+        "R17"
+      ],
+      "minutes": 13.0
+    },
+    {
+      "community": "Z5",
+      "shelter": "P3",
+      "priority": false,
+      "people": 135,
+      "roads": [
+        "R09",
+        "R17"
+      ],
+      "minutes": 13.0
+    },
+    {
+      "community": "Z2",
+      "shelter": "P2",
+      "priority": false,
+      "people": 80,
+      "roads": [
+        "R04",
+        "R16",
+        "R19"
+      ],
+      "minutes": 16.0
+    },
+    {
+      "community": "Z4",
+      "shelter": "P2",
+      "priority": true,
+      "people": 50,
+      "roads": [
+        "R07",
+        "R16",
+        "R19"
+      ],
+      "minutes": 13.0
+    },
+    {
+      "community": "Z4",
+      "shelter": "P2",
+      "priority": false,
+      "people": 160,
+      "roads": [
+        "R07",
+        "R16",
+        "R19"
+      ],
+      "minutes": 13.0
+    },
+    {
+      "community": "Z5",
+      "shelter": "P2",
+      "priority": false,
+      "people": 40,
+      "roads": [
+        "R09",
+        "R17",
+        "R22"
+      ],
+      "minutes": 25.0
+    },
+    {
+      "community": "Z5",
+      "shelter": "P2",
+      "priority": false,
+      "people": 20,
+      "roads": [
+        "R09",
+        "R23",
+        "R19"
+      ],
+      "minutes": 20.0
+    },
+    {
+      "community": "Z3",
+      "shelter": "P2",
+      "priority": false,
+      "people": 50,
+      "roads": [
+        "R05",
+        "R13",
+        "R16",
+        "R19"
+      ],
+      "minutes": 20.0
+    },
+    {
+      "community": "Z3",
+      "shelter": "P2",
+      "priority": false,
+      "people": 60,
+      "roads": [
+        "R05",
+        "R14",
+        "R23",
+        "R19"
+      ],
+      "minutes": 27.0
+    }
+  ],
+  "communities": [
+    {
+      "id": "Z1",
+      "population": 320,
+      "assigned": 240,
+      "unassigned": 80,
+      "priority_served": 90,
+      "priority_unassigned": 0
+    },
+    {
+      "id": "Z2",
+      "population": 260,
+      "assigned": 260,
+      "unassigned": 0,
+      "priority_served": 65,
+      "priority_unassigned": 0
+    },
+    {
+      "id": "Z3",
+      "population": 380,
+      "assigned": 270,
+      "unassigned": 110,
+      "priority_served": 110,
+      "priority_unassigned": 0
+    },
+    {
+      "id": "Z4",
+      "population": 210,
+      "assigned": 210,
+      "unassigned": 0,
+      "priority_served": 50,
+      "priority_unassigned": 0
+    },
+    {
+      "id": "Z5",
+      "population": 290,
+      "assigned": 280,
+      "unassigned": 10,
+      "priority_served": 85,
+      "priority_unassigned": 0
+    }
+  ],
+  "shelters": [
+    {
+      "id": "P1",
+      "available_capacity": 420,
+      "assigned": 420
+    },
+    {
+      "id": "P2",
+      "available_capacity": 480,
+      "assigned": 460
+    },
+    {
+      "id": "P3",
+      "available_capacity": 380,
+      "assigned": 380
+    },
+    {
+      "id": "P4",
+      "available_capacity": 0,
+      "assigned": 0
+    }
+  ],
+  "road_usage": [
+    {
+      "id": "R01",
+      "people": 240,
+      "capacity": 240
+    },
+    {
+      "id": "R03",
+      "people": 140,
+      "capacity": 260
+    },
+    {
+      "id": "R04",
+      "people": 120,
+      "capacity": 230
+    },
+    {
+      "id": "R05",
+      "people": 110,
+      "capacity": 300
+    },
+    {
+      "id": "R06",
+      "people": 160,
+      "capacity": 160
+    },
+    {
+      "id": "R07",
+      "people": 210,
+      "capacity": 260
+    },
+    {
+      "id": "R08",
+      "people": 0,
+      "capacity": 240
+    },
+    {
+      "id": "R09",
+      "people": 280,
+      "capacity": 280
+    },
+    {
+      "id": "R11",
+      "people": 0,
+      "capacity": 280
+    },
+    {
+      "id": "R12",
+      "people": 380,
+      "capacity": 380
+    },
+    {
+      "id": "R13",
+      "people": 50,
+      "capacity": 260
+    },
+    {
+      "id": "R14",
+      "people": 60,
+      "capacity": 220
+    },
+    {
+      "id": "R15",
+      "people": 40,
+      "capacity": 320
+    },
+    {
+      "id": "R16",
+      "people": 340,
+      "capacity": 340
+    },
+    {
+      "id": "R17",
+      "people": 420,
+      "capacity": 420
+    },
+    {
+      "id": "R18",
+      "people": 0,
+      "capacity": 230
+    },
+    {
+      "id": "R19",
+      "people": 420,
+      "capacity": 420
+    },
+    {
+      "id": "R20",
+      "people": 0,
+      "capacity": 420
+    },
+    {
+      "id": "R21",
+      "people": 0,
+      "capacity": 300
+    },
+    {
+      "id": "R22",
+      "people": 40,
+      "capacity": 280
+    },
+    {
+      "id": "R23",
+      "people": 80,
+      "capacity": 240
+    }
+  ],
+  "excluded_roads": [
+    {
+      "id": "R02",
+      "reason": "closed"
+    },
+    {
+      "id": "R10",
+      "reason": "stale"
+    }
+  ],
+  "excluded_shelters": [
+    {
+      "id": "P4",
+      "reason": "accessibility_filter"
+    }
+  ],
+  "dispatch": {
+    "assignments": [
+      {
+        "asset": "RES-01",
+        "community": "Z1",
+        "type": "rescue_team",
+        "minutes": 22.0,
+        "roads": [
+          "R21",
+          "R12",
+          "R01"
+        ]
+      },
+      {
+        "asset": "RES-02",
+        "community": "Z1",
+        "type": "rescue_team",
+        "minutes": 22.0,
+        "roads": [
+          "R21",
+          "R12",
+          "R01"
+        ]
+      },
+      {
+        "asset": "RES-03",
+        "community": "Z3",
+        "type": "rescue_team",
+        "minutes": 21.0,
+        "roads": [
+          "R20",
+          "R16",
+          "R13",
+          "R05"
+        ]
+      },
+      {
+        "asset": "RES-04",
+        "community": "Z3",
+        "type": "rescue_team",
+        "minutes": 21.0,
+        "roads": [
+          "R20",
+          "R16",
+          "R13",
+          "R05"
+        ]
+      },
+      {
+        "asset": "RES-05",
+        "community": "Z5",
+        "type": "rescue_team",
+        "minutes": 21.0,
+        "roads": [
+          "R20",
+          "R23",
+          "R09"
+        ]
+      },
+      {
+        "asset": "MED-01",
+        "community": "Z1",
+        "type": "medical_team",
+        "minutes": 15.0,
+        "roads": [
+          "R12",
+          "R01"
+        ]
+      },
+      {
+        "asset": "MED-02",
+        "community": "Z3",
+        "type": "medical_team",
+        "minutes": 18.0,
+        "roads": [
+          "R15",
+          "R13",
+          "R05"
+        ]
+      },
+      {
+        "asset": "MED-03",
+        "community": "Z3",
+        "type": "medical_team",
+        "minutes": 18.0,
+        "roads": [
+          "R15",
+          "R13",
+          "R05"
+        ]
+      },
+      {
+        "asset": "BUS-01",
+        "community": "Z1",
+        "type": "bus",
+        "minutes": 26.0,
+        "roads": [
+          "R19",
+          "R16",
+          "R04",
+          "R03",
+          "R01"
+        ]
+      },
+      {
+        "asset": "BUS-02",
+        "community": "Z1",
+        "type": "bus",
+        "minutes": 26.0,
+        "roads": [
+          "R19",
+          "R16",
+          "R04",
+          "R03",
+          "R01"
+        ]
+      },
+      {
+        "asset": "BUS-03",
+        "community": "Z3",
+        "type": "bus",
+        "minutes": 20.0,
+        "roads": [
+          "R19",
+          "R16",
+          "R13",
+          "R05"
+        ]
+      },
+      {
+        "asset": "BUS-04",
+        "community": "Z3",
+        "type": "bus",
+        "minutes": 20.0,
+        "roads": [
+          "R19",
+          "R16",
+          "R13",
+          "R05"
+        ]
+      }
+    ],
+    "requested_units": 22,
+    "assigned_units": 12,
+    "scope": "Independent one-way first-wave arrivals; no seats, return trips, service times or shared road usage with evacuation flow."
+  },
+  "limitations": [
+    "Synthetic schematic graph, populations and shelters; not real navigation.",
+    "Static throughput flow; not a time-expanded evacuation clearance model.",
+    "Priority people are an aggregate planning group, not medical triage.",
+    "Resource dispatch is independent; evacuation seats and assistance are not guaranteed.",
+    "Travel minutes exclude queues, boarding, service and return trips."
+  ]
+}

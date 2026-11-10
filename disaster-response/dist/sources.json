@@ -1,0 +1,86 @@
+[
+  {
+    "name": "MET Malaysia / data.gov.my",
+    "type": "OFFICIAL · WEATHER",
+    "status": "已验证浏览器读取 · 未用于规划",
+    "url": "https://developer.data.gov.my/realtime-api/weather",
+    "description": "预报、天气预警和地震警报。官方文档声明 CC BY 4.0。天气预警不能代替道路可通行性；页面按钮只读取资料，不改写演练模型。"
+  },
+  {
+    "name": "JPS Public Infobanjir",
+    "type": "OFFICIAL · HYDROLOGY",
+    "status": "官方入口 · 未接入",
+    "url": "https://publicinfobanjir.water.gov.my/",
+    "description": "河流水位与雨量监测。尚未确认适合本项目复用的稳定 API 和授权方式；没有使用旧 changelog 中的 flood-warning 作为可用接口。"
+  },
+  {
+    "name": "JKM InfoBencana",
+    "type": "OFFICIAL · PPS",
+    "status": "官方入口 · 未接入",
+    "url": "https://infobencanajkmv2.jkm.gov.my/landing/index.php",
+    "description": "PPS 与灾民统计的核对入口。网页上的总数不等于逐个 PPS 可用名额；实时容量、无障碍设施和授权数据接口仍需确认。"
+  },
+  {
+    "name": "NADMA Portal Bencana",
+    "type": "OFFICIAL · COORDINATION",
+    "status": "官方入口 · 未接入",
+    "url": "https://portalbencana.nadma.gov.my/ms/",
+    "description": "跨灾种态势及技术机构链接，包括天气、洪灾、道路与 PPS。模型将它作为权威核对入口，没有导入网页上未验证的实时数字。"
+  },
+  {
+    "name": "DOSM District Population",
+    "type": "OFFICIAL · EXPOSURE",
+    "status": "已提供样本连接器",
+    "url": "https://data.gov.my/data-catalogue/population_district",
+    "description": "行政区人口与年龄分组资料，CC BY 4.0。population 单位为千人；不能直接当作实时待撤离人数，也不能把总计和年龄明细重复相加。"
+  },
+  {
+    "name": "OSMnx · gboeing/osmnx",
+    "type": "GITHUB · GIS / MIT",
+    "status": "已提供导入脚本 · 未执行联网导入",
+    "url": "https://github.com/gboeing/osmnx",
+    "description": "获取 OpenStreetMap 路网并导出 GraphML / GIS 文件。OSM 路网不含已核实的灾中封路；导入结果默认无通行授权，需补充现场资料。"
+  },
+  {
+    "name": "Google OR-Tools",
+    "type": "GITHUB · OPTIMISATION / APACHE-2.0",
+    "status": "下一阶段候选",
+    "url": "https://github.com/google/or-tools",
+    "description": "适合扩展带时窗、车辆容量及多任务的救援调度。本版已运行原创整数最小费用最大流，不宣称已经使用 OR-Tools 或求解完整车辆路径问题。"
+  },
+  {
+    "name": "Project OSRM",
+    "type": "GITHUB · ROUTING / BSD-2-CLAUSE",
+    "status": "下一阶段候选",
+    "url": "https://github.com/Project-OSRM/osrm-backend",
+    "description": "道路路由与行程时间服务。真实部署需要自托管，并叠加封闭、禁入与时变风险；普通驾车最快路线不能直接当作灾中撤离路线。"
+  },
+  {
+    "name": "Sahana Eden",
+    "type": "GITHUB · HUMANITARIAN / MIT",
+    "status": "需求与架构参考",
+    "url": "https://github.com/sahana/eden",
+    "description": "人道与应急管理应用开发框架。基金会说明 2025 年主线改为 Eden ASP，旧版进入归档。本项目没有部署 Eden，也没有复制其代码。"
+  },
+  {
+    "name": "InaSAFE",
+    "type": "GITHUB · HAZARD IMPACT / GPL-3.0",
+    "status": "研究候选 · 未集成",
+    "url": "https://github.com/inasafe/inasafe",
+    "description": "灾害影响与 GIS 分析参考；未来用于研究危险度、暴露人口与影响函数的连接。尚未验证当前 QGIS 兼容性，未引入 GPL 代码。"
+  },
+  {
+    "name": "CLIMADA · ETH Zurich",
+    "type": "GITHUB · ACTUARIAL RISK / GPL-3.0",
+    "status": "研究候选 · 未集成",
+    "url": "https://github.com/CLIMADA-project/climada_python",
+    "description": "气候风险、暴露与脆弱性研究框架，适合扩展到你的精算风险主线。巨灾损失评估与分钟级救援调度用途不同；本版没有运行 CLIMADA。"
+  },
+  {
+    "name": "WorldPop",
+    "type": "RESEARCH · POPULATION GRID",
+    "status": "高分辨率暴露候选",
+    "url": "https://www.worldpop.org/",
+    "description": "高分辨率空间人口数据候选。需按具体产品确认年份、分辨率、许可与不确定性，再与 DOSM 总量校核；不能把栅格估计当作现场人数。"
+  }
+]
