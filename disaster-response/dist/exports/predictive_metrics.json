@@ -1,0 +1,27 @@
+{
+  "mode": "synthetic_training_only",
+  "seed": 17,
+  "features": [
+    "lag1_rain_mm",
+    "lag1_river_index"
+  ],
+  "split": "first 335 observations training, remaining 144 chronological holdout; scaler fit on training only",
+  "train_n": 335,
+  "test_n": 144,
+  "coefficients": [
+    0.20126591946357328,
+    0.7279250015584249,
+    1.4035262754979445
+  ],
+  "train_mean": [
+    23.794300682113086,
+    2.0785823310985134
+  ],
+  "train_std": [
+    21.084439298914226,
+    1.1285870735945793
+  ],
+  "holdout_brier": 0.19371624794304024,
+  "constant_baseline_brier": 0.24969128239400018,
+  "limitation": "Illustrates APROM/PA workflow; no predictive validity for real Malaysian floods. Not used by routing."
+}

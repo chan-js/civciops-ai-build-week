@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.env
+.env.*
+!.env.example
+outputs/
+*.sqlite
+.Rhistory
+.RData
+.Rproj.user/
+.sites/

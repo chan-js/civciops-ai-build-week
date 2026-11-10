@@ -1,0 +1,13 @@
+﻿asset,community,type,minutes,roads
+RES-01,Z1,rescue_team,22.0,R21|R12|R01
+RES-02,Z1,rescue_team,22.0,R21|R12|R01
+RES-03,Z3,rescue_team,21.0,R20|R16|R13|R05
+RES-04,Z3,rescue_team,21.0,R20|R16|R13|R05
+RES-05,Z5,rescue_team,21.0,R20|R23|R09
+MED-01,Z1,medical_team,15.0,R12|R01
+MED-02,Z3,medical_team,18.0,R15|R13|R05
+MED-03,Z3,medical_team,18.0,R15|R13|R05
+BUS-01,Z1,bus,26.0,R19|R16|R04|R03|R01
+BUS-02,Z1,bus,26.0,R19|R16|R04|R03|R01
+BUS-03,Z3,bus,20.0,R19|R16|R13|R05
+BUS-04,Z3,bus,20.0,R19|R16|R13|R05

@@ -1,0 +1,1 @@
+{"name":"civicops-resilience","version":"0.1.0","private":true,"type":"module","description":"Static research console with matching Python and browser planning engines","scripts":{"test":"node tests/parity.mjs"}}

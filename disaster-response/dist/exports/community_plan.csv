@@ -1,0 +1,6 @@
+﻿id,population,assigned,unassigned,priority_served,priority_unassigned
+Z1,320,240,80,90,0
+Z2,260,260,0,65,0
+Z3,380,270,110,110,0
+Z4,210,210,0,50,0
+Z5,290,280,10,85,0
